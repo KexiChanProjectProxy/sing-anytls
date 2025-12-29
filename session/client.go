@@ -36,6 +36,7 @@ type Client struct {
 	maxConnectionLifetime    time.Duration
 	connectionLifetimeJitter time.Duration
 	minIdleSession           int
+	minIdleSessionForAge     int
 	ensureIdleSession        int
 	heartbeat                time.Duration
 
@@ -43,7 +44,7 @@ type Client struct {
 }
 
 func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFunc,
-	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout, maxConnectionLifetime, connectionLifetimeJitter time.Duration, minIdleSession int, ensureIdleSession int, heartbeat time.Duration,
+	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout, maxConnectionLifetime, connectionLifetimeJitter time.Duration, minIdleSession, minIdleSessionForAge, ensureIdleSession int, heartbeat time.Duration,
 ) *Client {
 	c := &Client{
 		sessions:                 make(map[uint64]*Session),
@@ -53,6 +54,7 @@ func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFu
 		maxConnectionLifetime:    maxConnectionLifetime,
 		connectionLifetimeJitter: connectionLifetimeJitter,
 		minIdleSession:           minIdleSession,
+		minIdleSessionForAge:     minIdleSessionForAge,
 		ensureIdleSession:        ensureIdleSession,
 		heartbeat:                heartbeat,
 		logger:                   logger,
@@ -354,11 +356,11 @@ func (c *Client) ageCleanup() {
 		}
 	}
 
-	// Calculate how many sessions we can safely close while respecting min_idle_session
-	maxCanClose := currentIdleCount - c.minIdleSession
+	// Calculate how many sessions we can safely close while respecting min_idle_session_for_age
+	maxCanClose := currentIdleCount - c.minIdleSessionForAge
 	if maxCanClose <= 0 {
-		c.logger.Debug(fmt.Sprintf("[AgeCleanup] Found %d expired sessions, but skipping cleanup to maintain min_idle_session=%d (current=%d)",
-			len(expiredSessions), c.minIdleSession, currentIdleCount))
+		c.logger.Debug(fmt.Sprintf("[AgeCleanup] Found %d expired sessions, but skipping cleanup to maintain min_idle_session_for_age=%d (current=%d)",
+			len(expiredSessions), c.minIdleSessionForAge, currentIdleCount))
 		return
 	}
 
@@ -369,8 +371,8 @@ func (c *Client) ageCleanup() {
 		keptCount = len(expiredSessions) - maxCanClose
 	}
 
-	c.logger.Debug(fmt.Sprintf("[AgeCleanup] Found %d expired sessions, closing %d oldest (keeping %d to maintain min_idle_session=%d)",
-		len(expiredSessions), len(sessionsToClose), keptCount, c.minIdleSession))
+	c.logger.Debug(fmt.Sprintf("[AgeCleanup] Found %d expired sessions, closing %d oldest (keeping %d to maintain min_idle_session_for_age=%d)",
+		len(expiredSessions), len(sessionsToClose), keptCount, c.minIdleSessionForAge))
 
 	// Close sessions starting from oldest
 	c.idleSessionLock.Lock()
