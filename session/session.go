@@ -35,6 +35,7 @@ type Session struct {
 
 	// pool
 	seq       uint64
+	createdAt time.Time
 	idleSince time.Time
 	padding   *atomic.TypedValue[*padding.PaddingFactory]
 	logger    logger.Logger
@@ -47,18 +48,20 @@ type Session struct {
 	buffering   bool
 	buffer      []byte
 	pktCounter  atomic.Uint32
+	heartbeat   time.Duration
 
 	// server
 	onNewStream func(stream *Stream)
 }
 
-func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.PaddingFactory], logger logger.Logger) *Session {
+func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.PaddingFactory], logger logger.Logger, heartbeat time.Duration) *Session {
 	s := &Session{
 		conn:        conn,
 		isClient:    true,
 		sendPadding: true,
 		padding:     _padding,
 		logger:      logger,
+		heartbeat:   heartbeat,
 	}
 	s.die = make(chan struct{})
 	s.streams = make(map[uint32]*Stream)
@@ -94,6 +97,11 @@ func (s *Session) Run() {
 	s.writeControlFrame(f)
 
 	go s.recvLoop()
+
+	// Start heartbeat goroutine if enabled
+	if s.heartbeat > 0 {
+		go s.heartbeatLoop()
+	}
 }
 
 // IsClosed does a safe check to see if we have shutdown
@@ -327,11 +335,12 @@ func (s *Session) recvLoop() error {
 					}
 				}
 			case cmdHeartRequest:
+				// Server side: respond to heartbeat silently (too verbose for debug)
 				if _, err := s.writeControlFrame(newFrame(cmdHeartResponse, sid)); err != nil {
 					return err
 				}
 			case cmdHeartResponse:
-				// Active keepalive checking is not implemented yet
+				// Client side: received response, connection is alive (no need to log)
 				break
 			case cmdServerSettings:
 				if hdr.Length() > 0 {
@@ -354,6 +363,44 @@ func (s *Session) recvLoop() error {
 			}
 		} else {
 			return err
+		}
+	}
+}
+
+func (s *Session) heartbeatLoop() {
+	// Add jitter (0-20% of heartbeat interval) to prevent thundering herd
+	// This ensures sessions don't all send heartbeats at exactly the same time
+	import_time := time.Now().UnixNano()
+	jitter := time.Duration(import_time % int64(s.heartbeat/5))
+
+	s.logger.Debug(fmt.Sprintf("[Heartbeat][Session#%d] Starting heartbeat loop with %v interval (jitter: %v)", s.seq, s.heartbeat, jitter))
+
+	// Wait for jitter before starting the ticker
+	time.Sleep(jitter)
+
+	ticker := time.NewTicker(s.heartbeat)
+	defer ticker.Stop()
+
+	heartbeatCount := 0
+	for {
+		select {
+		case <-ticker.C:
+			if s.IsClosed() {
+				return
+			}
+			heartbeatCount++
+			// Only log every 10th heartbeat at debug level, otherwise trace
+			if heartbeatCount%10 == 1 {
+				s.logger.Debug(fmt.Sprintf("[Heartbeat][Session#%d] Sending heartbeat #%d", s.seq, heartbeatCount))
+			}
+			if _, err := s.writeControlFrame(newFrame(cmdHeartRequest, 0)); err != nil {
+				s.logger.Warn(fmt.Sprintf("[Heartbeat][Session#%d] Failed to send heartbeat #%d: %v", s.seq, heartbeatCount, err))
+				s.Close()
+				return
+			}
+		case <-s.die:
+			s.logger.Debug(fmt.Sprintf("[Heartbeat][Session#%d] Stopped after %d heartbeats", s.seq, heartbeatCount))
+			return
 		}
 	}
 }

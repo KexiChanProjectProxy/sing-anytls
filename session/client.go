@@ -32,22 +32,28 @@ type Client struct {
 
 	padding *atomic.TypedValue[*padding.PaddingFactory]
 
-	idleSessionTimeout time.Duration
-	minIdleSession     int
+	idleSessionTimeout    time.Duration
+	maxConnectionLifetime time.Duration
+	minIdleSession        int
+	ensureIdleSession     int
+	heartbeat             time.Duration
 
 	logger logger.Logger
 }
 
 func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFunc,
-	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout time.Duration, minIdleSession int,
+	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout, maxConnectionLifetime time.Duration, minIdleSession int, ensureIdleSession int, heartbeat time.Duration,
 ) *Client {
 	c := &Client{
-		sessions:           make(map[uint64]*Session),
-		dialOut:            dialOut,
-		padding:            _padding,
-		idleSessionTimeout: idleSessionTimeout,
-		minIdleSession:     minIdleSession,
-		logger:             logger,
+		sessions:              make(map[uint64]*Session),
+		dialOut:               dialOut,
+		padding:               _padding,
+		idleSessionTimeout:    idleSessionTimeout,
+		maxConnectionLifetime: maxConnectionLifetime,
+		minIdleSession:        minIdleSession,
+		ensureIdleSession:     ensureIdleSession,
+		heartbeat:             heartbeat,
+		logger:                logger,
 	}
 	if idleSessionCheckInterval <= time.Second*5 {
 		idleSessionCheckInterval = time.Second * 30
@@ -61,6 +67,8 @@ func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFu
 		for {
 			time.Sleep(idleSessionCheckInterval)
 			c.idleCleanup()
+			c.ageCleanup()
+			c.ensureIdleSessionPool()
 			select {
 			case <-c.die.Done():
 				return
@@ -131,8 +139,9 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 		return nil, err
 	}
 
-	session := NewClientSession(underlying, c.padding, c.logger)
+	session := NewClientSession(underlying, c.padding, c.logger, c.heartbeat)
 	session.seq = c.sessionCounter.Add(1)
+	session.createdAt = time.Now()
 	session.dieHook = func() {
 		c.idleSessionLock.Lock()
 		c.idleSession.Remove(math.MaxUint64 - session.seq)
@@ -203,4 +212,131 @@ func (c *Client) idleCleanupExpTime(expTime time.Time) {
 	for _, session := range sessionToClose {
 		session.Close()
 	}
+}
+
+// ensureIdleSessionPool ensures that at least ensureIdleSession idle sessions exist in the pool.
+// If the current count is below the target, it creates new sessions asynchronously.
+func (c *Client) ensureIdleSessionPool() {
+	// Feature disabled if ensureIdleSession is 0
+	if c.ensureIdleSession <= 0 {
+		return
+	}
+
+	// Check if client is closing
+	select {
+	case <-c.die.Done():
+		return
+	default:
+	}
+
+	// Count current idle sessions
+	c.idleSessionLock.Lock()
+	currentIdleCount := c.idleSession.Len()
+	c.idleSessionLock.Unlock()
+
+	// Calculate how many sessions we need to create
+	deficit := c.ensureIdleSession - currentIdleCount
+	if deficit <= 0 {
+		return
+	}
+
+	c.logger.Debug(fmt.Sprintf("[EnsureIdleSession] Current idle sessions: %d, target: %d, creating %d new sessions",
+		currentIdleCount, c.ensureIdleSession, deficit))
+
+	// Create sessions asynchronously to not block the periodic check
+	for i := 0; i < deficit; i++ {
+		go func(index int) {
+			// Check if client is closing before creating
+			select {
+			case <-c.die.Done():
+				return
+			default:
+			}
+
+			// Create session with background context (not tied to any specific stream request)
+			session, err := c.createSession(context.Background())
+			if err != nil {
+				c.logger.Debug(fmt.Sprintf("[EnsureIdleSession] Failed to create session #%d: %v", index+1, err))
+				return
+			}
+
+			// Immediately add to idle pool
+			c.idleSessionLock.Lock()
+			session.idleSince = time.Now()
+			c.idleSession.Insert(math.MaxUint64-session.seq, session)
+			c.idleSessionLock.Unlock()
+
+			c.logger.Debug(fmt.Sprintf("[EnsureIdleSession] Successfully created and pooled session #%d (seq=%d)",
+				index+1, session.seq))
+		}(i)
+	}
+}
+
+// ageCleanup closes idle sessions that have exceeded their maximum lifetime.
+// Older connections are prioritized for closure.
+func (c *Client) ageCleanup() {
+	// Feature disabled if maxConnectionLifetime is 0
+	if c.maxConnectionLifetime <= 0 {
+		return
+	}
+
+	now := time.Now()
+	maxAge := now.Add(-c.maxConnectionLifetime)
+
+	type sessionToClose struct {
+		session   *Session
+		key       uint64
+		createdAt time.Time
+	}
+
+	var expiredSessions []sessionToClose
+
+	// Collect all idle sessions that have exceeded max lifetime
+	c.idleSessionLock.Lock()
+	it := c.idleSession.Iterate()
+	for it.IsNotEnd() {
+		session := it.Value()
+		key := it.Key()
+		it.MoveToNext()
+
+		// Check if session is older than maxConnectionLifetime
+		if session.createdAt.Before(maxAge) {
+			expiredSessions = append(expiredSessions, sessionToClose{
+				session:   session,
+				key:       key,
+				createdAt: session.createdAt,
+			})
+		}
+	}
+	c.idleSessionLock.Unlock()
+
+	// If no expired sessions, nothing to do
+	if len(expiredSessions) == 0 {
+		return
+	}
+
+	// Sort by creation time (oldest first)
+	// Since we want to close older connections first, sort in ascending order by createdAt
+	for i := 0; i < len(expiredSessions)-1; i++ {
+		for j := i + 1; j < len(expiredSessions); j++ {
+			if expiredSessions[i].createdAt.After(expiredSessions[j].createdAt) {
+				expiredSessions[i], expiredSessions[j] = expiredSessions[j], expiredSessions[i]
+			}
+		}
+	}
+
+	c.logger.Debug(fmt.Sprintf("[AgeCleanup] Found %d idle sessions exceeding max lifetime (%v), closing oldest first",
+		len(expiredSessions), c.maxConnectionLifetime))
+
+	// Close sessions starting from oldest
+	c.idleSessionLock.Lock()
+	for i, s := range expiredSessions {
+		c.idleSession.Remove(s.key)
+		age := now.Sub(s.session.createdAt)
+		c.logger.Debug(fmt.Sprintf("[AgeCleanup] Closing session #%d (seq=%d, age=%v, created=%v)",
+			i+1, s.session.seq, age, s.session.createdAt))
+		// Close outside the lock to avoid blocking
+		go s.session.Close()
+	}
+	c.idleSessionLock.Unlock()
 }
