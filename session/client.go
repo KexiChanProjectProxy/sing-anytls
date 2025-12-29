@@ -32,32 +32,34 @@ type Client struct {
 
 	padding *atomic.TypedValue[*padding.PaddingFactory]
 
-	idleSessionTimeout       time.Duration
-	maxConnectionLifetime    time.Duration
-	connectionLifetimeJitter time.Duration
-	minIdleSession           int
-	minIdleSessionForAge     int
-	ensureIdleSession        int
-	heartbeat                time.Duration
+	idleSessionTimeout          time.Duration
+	maxConnectionLifetime       time.Duration
+	connectionLifetimeJitter    time.Duration
+	minIdleSession              int
+	minIdleSessionForAge        int
+	ensureIdleSession           int
+	ensureIdleSessionCreateRate int
+	heartbeat                   time.Duration
 
 	logger logger.Logger
 }
 
 func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFunc,
-	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout, maxConnectionLifetime, connectionLifetimeJitter time.Duration, minIdleSession, minIdleSessionForAge, ensureIdleSession int, heartbeat time.Duration,
+	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout, maxConnectionLifetime, connectionLifetimeJitter time.Duration, minIdleSession, minIdleSessionForAge, ensureIdleSession, ensureIdleSessionCreateRate int, heartbeat time.Duration,
 ) *Client {
 	c := &Client{
-		sessions:                 make(map[uint64]*Session),
-		dialOut:                  dialOut,
-		padding:                  _padding,
-		idleSessionTimeout:       idleSessionTimeout,
-		maxConnectionLifetime:    maxConnectionLifetime,
-		connectionLifetimeJitter: connectionLifetimeJitter,
-		minIdleSession:           minIdleSession,
-		minIdleSessionForAge:     minIdleSessionForAge,
-		ensureIdleSession:        ensureIdleSession,
-		heartbeat:                heartbeat,
-		logger:                   logger,
+		sessions:                    make(map[uint64]*Session),
+		dialOut:                     dialOut,
+		padding:                     _padding,
+		idleSessionTimeout:          idleSessionTimeout,
+		maxConnectionLifetime:       maxConnectionLifetime,
+		connectionLifetimeJitter:    connectionLifetimeJitter,
+		minIdleSession:              minIdleSession,
+		minIdleSessionForAge:        minIdleSessionForAge,
+		ensureIdleSession:           ensureIdleSession,
+		ensureIdleSessionCreateRate: ensureIdleSessionCreateRate,
+		heartbeat:                   heartbeat,
+		logger:                      logger,
 	}
 	if idleSessionCheckInterval <= time.Second*5 {
 		idleSessionCheckInterval = time.Second * 30
@@ -290,11 +292,19 @@ func (c *Client) ensureIdleSessionPool() {
 		return
 	}
 
-	c.logger.Debug(fmt.Sprintf("[EnsureIdleSession] Current idle sessions: %d, target: %d, creating %d new sessions",
-		currentIdleCount, c.ensureIdleSession, deficit))
+	// Apply rate limiting if configured
+	toCreate := deficit
+	if c.ensureIdleSessionCreateRate > 0 && deficit > c.ensureIdleSessionCreateRate {
+		toCreate = c.ensureIdleSessionCreateRate
+		c.logger.Debug(fmt.Sprintf("[EnsureIdleSession] Current idle sessions: %d, target: %d, deficit=%d, rate-limited to creating %d sessions (will create %d more in next cycle)",
+			currentIdleCount, c.ensureIdleSession, deficit, toCreate, deficit-toCreate))
+	} else {
+		c.logger.Debug(fmt.Sprintf("[EnsureIdleSession] Current idle sessions: %d, target: %d, creating %d new sessions",
+			currentIdleCount, c.ensureIdleSession, toCreate))
+	}
 
 	// Create sessions asynchronously to not block the periodic check
-	for i := 0; i < deficit; i++ {
+	for i := 0; i < toCreate; i++ {
 		go func(index int) {
 			// Check if client is closing before creating
 			select {
