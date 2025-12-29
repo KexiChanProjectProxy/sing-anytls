@@ -207,9 +207,18 @@ func (c *Client) idleCleanup() {
 
 func (c *Client) idleCleanupExpTime(expTime time.Time) {
 	activeCount := 0
-	var sessionToClose []*Session
+	protectedCount := 0
+	now := time.Now()
+
+	type sessionInfo struct {
+		session   *Session
+		key       uint64
+		idleTime  time.Duration
+	}
+	var sessionToClose []sessionInfo
 
 	c.idleSessionLock.Lock()
+	currentIdleCount := c.idleSession.Len()
 	it := c.idleSession.Iterate()
 	for it.IsNotEnd() {
 		session := it.Value()
@@ -224,16 +233,34 @@ func (c *Client) idleCleanupExpTime(expTime time.Time) {
 		if activeCount < c.minIdleSession {
 			session.idleSince = time.Now()
 			activeCount++
+			protectedCount++
 			continue
 		}
 
-		sessionToClose = append(sessionToClose, session)
+		sessionToClose = append(sessionToClose, sessionInfo{
+			session:  session,
+			key:      key,
+			idleTime: now.Sub(session.idleSince),
+		})
 		c.idleSession.Remove(key)
 	}
 	c.idleSessionLock.Unlock()
 
-	for _, session := range sessionToClose {
-		session.Close()
+	// Log cleanup activity if there are sessions to close or sessions were protected
+	if len(sessionToClose) > 0 || protectedCount > 0 {
+		if protectedCount > 0 {
+			c.logger.Debug(fmt.Sprintf("[IdleCleanup] Found %d expired sessions (timeout=%v), closing %d (keeping %d to maintain min_idle_session=%d, current=%d)",
+				len(sessionToClose)+protectedCount, c.idleSessionTimeout, len(sessionToClose), protectedCount, c.minIdleSession, currentIdleCount))
+		} else {
+			c.logger.Debug(fmt.Sprintf("[IdleCleanup] Found %d expired sessions (timeout=%v), closing all (current=%d)",
+				len(sessionToClose), c.idleSessionTimeout, currentIdleCount))
+		}
+	}
+
+	for i, s := range sessionToClose {
+		c.logger.Debug(fmt.Sprintf("[IdleCleanup] Closing session #%d (seq=%d, idle=%v, idleSince=%v)",
+			i+1, s.session.seq, s.idleTime, s.session.idleSince))
+		s.session.Close()
 	}
 }
 
