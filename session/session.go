@@ -34,11 +34,12 @@ type Session struct {
 	synDoneLock sync.Mutex
 
 	// pool
-	seq       uint64
-	createdAt time.Time
-	idleSince time.Time
-	padding   *atomic.TypedValue[*padding.PaddingFactory]
-	logger    logger.Logger
+	seq         uint64
+	createdAt   time.Time
+	maxLifetime time.Duration
+	idleSince   time.Time
+	padding     *atomic.TypedValue[*padding.PaddingFactory]
+	logger      logger.Logger
 
 	peerVersion byte
 

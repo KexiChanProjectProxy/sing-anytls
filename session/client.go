@@ -32,28 +32,30 @@ type Client struct {
 
 	padding *atomic.TypedValue[*padding.PaddingFactory]
 
-	idleSessionTimeout    time.Duration
-	maxConnectionLifetime time.Duration
-	minIdleSession        int
-	ensureIdleSession     int
-	heartbeat             time.Duration
+	idleSessionTimeout       time.Duration
+	maxConnectionLifetime    time.Duration
+	connectionLifetimeJitter time.Duration
+	minIdleSession           int
+	ensureIdleSession        int
+	heartbeat                time.Duration
 
 	logger logger.Logger
 }
 
 func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFunc,
-	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout, maxConnectionLifetime time.Duration, minIdleSession int, ensureIdleSession int, heartbeat time.Duration,
+	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout, maxConnectionLifetime, connectionLifetimeJitter time.Duration, minIdleSession int, ensureIdleSession int, heartbeat time.Duration,
 ) *Client {
 	c := &Client{
-		sessions:              make(map[uint64]*Session),
-		dialOut:               dialOut,
-		padding:               _padding,
-		idleSessionTimeout:    idleSessionTimeout,
-		maxConnectionLifetime: maxConnectionLifetime,
-		minIdleSession:        minIdleSession,
-		ensureIdleSession:     ensureIdleSession,
-		heartbeat:             heartbeat,
-		logger:                logger,
+		sessions:                 make(map[uint64]*Session),
+		dialOut:                  dialOut,
+		padding:                  _padding,
+		idleSessionTimeout:       idleSessionTimeout,
+		maxConnectionLifetime:    maxConnectionLifetime,
+		connectionLifetimeJitter: connectionLifetimeJitter,
+		minIdleSession:           minIdleSession,
+		ensureIdleSession:        ensureIdleSession,
+		heartbeat:                heartbeat,
+		logger:                   logger,
 	}
 	if idleSessionCheckInterval <= time.Second*5 {
 		idleSessionCheckInterval = time.Second * 30
@@ -142,6 +144,25 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 	session := NewClientSession(underlying, c.padding, c.logger, c.heartbeat)
 	session.seq = c.sessionCounter.Add(1)
 	session.createdAt = time.Now()
+
+	// Assign randomized lifetime if configured
+	if c.maxConnectionLifetime > 0 {
+		if c.connectionLifetimeJitter > 0 {
+			// Calculate random lifetime: base ± jitter
+			// Use session.seq as seed for deterministic but varied randomness
+			jitterNanos := c.connectionLifetimeJitter.Nanoseconds()
+			// Random value in range [-jitter, +jitter]
+			randomJitter := time.Duration((int64(session.seq)*31337)%jitterNanos - jitterNanos/2)
+			session.maxLifetime = c.maxConnectionLifetime + randomJitter
+			// Ensure lifetime is positive
+			if session.maxLifetime < time.Second {
+				session.maxLifetime = time.Second
+			}
+		} else {
+			session.maxLifetime = c.maxConnectionLifetime
+		}
+	}
+
 	session.dieHook = func() {
 		c.idleSessionLock.Lock()
 		c.idleSession.Remove(math.MaxUint64 - session.seq)
@@ -273,7 +294,7 @@ func (c *Client) ensureIdleSessionPool() {
 }
 
 // ageCleanup closes idle sessions that have exceeded their maximum lifetime.
-// Older connections are prioritized for closure.
+// Older connections are prioritized for closure, while respecting min_idle_session.
 func (c *Client) ageCleanup() {
 	// Feature disabled if maxConnectionLifetime is 0
 	if c.maxConnectionLifetime <= 0 {
@@ -281,31 +302,39 @@ func (c *Client) ageCleanup() {
 	}
 
 	now := time.Now()
-	maxAge := now.Add(-c.maxConnectionLifetime)
 
 	type sessionToClose struct {
 		session   *Session
 		key       uint64
 		createdAt time.Time
+		age       time.Duration
+		maxLife   time.Duration
 	}
 
 	var expiredSessions []sessionToClose
+	var keptCount int
 
-	// Collect all idle sessions that have exceeded max lifetime
+	// Collect all idle sessions that have exceeded their individual max lifetime
 	c.idleSessionLock.Lock()
+	currentIdleCount := c.idleSession.Len()
 	it := c.idleSession.Iterate()
 	for it.IsNotEnd() {
 		session := it.Value()
 		key := it.Key()
 		it.MoveToNext()
 
-		// Check if session is older than maxConnectionLifetime
-		if session.createdAt.Before(maxAge) {
-			expiredSessions = append(expiredSessions, sessionToClose{
-				session:   session,
-				key:       key,
-				createdAt: session.createdAt,
-			})
+		// Check if session has exceeded its individual max lifetime
+		if session.maxLifetime > 0 {
+			age := now.Sub(session.createdAt)
+			if age >= session.maxLifetime {
+				expiredSessions = append(expiredSessions, sessionToClose{
+					session:   session,
+					key:       key,
+					createdAt: session.createdAt,
+					age:       age,
+					maxLife:   session.maxLifetime,
+				})
+			}
 		}
 	}
 	c.idleSessionLock.Unlock()
@@ -325,16 +354,30 @@ func (c *Client) ageCleanup() {
 		}
 	}
 
-	c.logger.Debug(fmt.Sprintf("[AgeCleanup] Found %d idle sessions exceeding max lifetime (%v), closing oldest first",
-		len(expiredSessions), c.maxConnectionLifetime))
+	// Calculate how many sessions we can safely close while respecting min_idle_session
+	maxCanClose := currentIdleCount - c.minIdleSession
+	if maxCanClose <= 0 {
+		c.logger.Debug(fmt.Sprintf("[AgeCleanup] Found %d expired sessions, but skipping cleanup to maintain min_idle_session=%d (current=%d)",
+			len(expiredSessions), c.minIdleSession, currentIdleCount))
+		return
+	}
+
+	// Limit to closing only what we can afford
+	sessionsToClose := expiredSessions
+	if len(expiredSessions) > maxCanClose {
+		sessionsToClose = expiredSessions[:maxCanClose]
+		keptCount = len(expiredSessions) - maxCanClose
+	}
+
+	c.logger.Debug(fmt.Sprintf("[AgeCleanup] Found %d expired sessions, closing %d oldest (keeping %d to maintain min_idle_session=%d)",
+		len(expiredSessions), len(sessionsToClose), keptCount, c.minIdleSession))
 
 	// Close sessions starting from oldest
 	c.idleSessionLock.Lock()
-	for i, s := range expiredSessions {
+	for i, s := range sessionsToClose {
 		c.idleSession.Remove(s.key)
-		age := now.Sub(s.session.createdAt)
-		c.logger.Debug(fmt.Sprintf("[AgeCleanup] Closing session #%d (seq=%d, age=%v, created=%v)",
-			i+1, s.session.seq, age, s.session.createdAt))
+		c.logger.Debug(fmt.Sprintf("[AgeCleanup] Closing session #%d (seq=%d, age=%v, maxLife=%v, created=%v)",
+			i+1, s.session.seq, s.age, s.maxLife, s.session.createdAt))
 		// Close outside the lock to avoid blocking
 		go s.session.Close()
 	}

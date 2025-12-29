@@ -21,6 +21,7 @@ type ClientConfig struct {
 	IdleSessionCheckInterval time.Duration
 	IdleSessionTimeout       time.Duration
 	MaxConnectionLifetime    time.Duration
+	ConnectionLifetimeJitter time.Duration
 	MinIdleSession           int
 	EnsureIdleSession        int
 	Heartbeat                time.Duration
@@ -43,7 +44,7 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	}
 	// Initialize the padding state of this client
 	padding.UpdatePaddingScheme(padding.DefaultPaddingScheme, &c.padding)
-	c.sessionClient = session.NewClient(ctx, config.Logger, c.createOutboundConnection, &c.padding, config.IdleSessionCheckInterval, config.IdleSessionTimeout, config.MaxConnectionLifetime, config.MinIdleSession, config.EnsureIdleSession, config.Heartbeat)
+	c.sessionClient = session.NewClient(ctx, config.Logger, c.createOutboundConnection, &c.padding, config.IdleSessionCheckInterval, config.IdleSessionTimeout, config.MaxConnectionLifetime, config.ConnectionLifetimeJitter, config.MinIdleSession, config.EnsureIdleSession, config.Heartbeat)
 	return c, nil
 }
 
