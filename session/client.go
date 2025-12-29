@@ -41,11 +41,12 @@ type Client struct {
 	ensureIdleSessionCreateRate int
 	heartbeat                   time.Duration
 
-	logger logger.Logger
+	logger          logger.Logger
+	metricsCallback MetricsCallback
 }
 
 func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFunc,
-	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout, maxConnectionLifetime, connectionLifetimeJitter time.Duration, minIdleSession, minIdleSessionForAge, ensureIdleSession, ensureIdleSessionCreateRate int, heartbeat time.Duration,
+	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout, maxConnectionLifetime, connectionLifetimeJitter time.Duration, minIdleSession, minIdleSessionForAge, ensureIdleSession, ensureIdleSessionCreateRate int, heartbeat time.Duration, metricsCallback MetricsCallback,
 ) *Client {
 	c := &Client{
 		sessions:                    make(map[uint64]*Session),
@@ -60,6 +61,7 @@ func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFu
 		ensureIdleSessionCreateRate: ensureIdleSessionCreateRate,
 		heartbeat:                   heartbeat,
 		logger:                      logger,
+		metricsCallback:             metricsCallback,
 	}
 	if idleSessionCheckInterval <= time.Second*5 {
 		idleSessionCheckInterval = time.Second * 30
@@ -97,19 +99,44 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 	var err error
 
 	session = c.getIdleSession()
+	sessionCreated := false
 	if session == nil {
 		session, err = c.createSession(ctx)
+		sessionCreated = true
 	}
 	if session == nil {
+		if c.metricsCallback != nil {
+			c.metricsCallback.StreamError()
+		}
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
+
+	// Report session creation for on-demand sessions
+	if sessionCreated && c.metricsCallback != nil {
+		c.metricsCallback.SessionCreated("demand")
+		c.updatePoolMetrics()
+	}
+
 	stream, err = session.OpenStream()
 	if err != nil {
 		session.Close()
+		if c.metricsCallback != nil {
+			c.metricsCallback.StreamError()
+		}
 		return nil, fmt.Errorf("failed to create stream: %w", err)
 	}
 
+	// Report stream opened
+	if c.metricsCallback != nil {
+		c.metricsCallback.StreamOpened()
+	}
+
 	stream.dieHook = func() {
+		// Report stream closed
+		if c.metricsCallback != nil {
+			c.metricsCallback.StreamClosed()
+		}
+
 		// If Session is not closed, put this Stream to pool
 		if !session.IsClosed() {
 			select {
@@ -121,6 +148,9 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 				session.idleSince = time.Now()
 				c.idleSession.Insert(math.MaxUint64-session.seq, session)
 				c.idleSessionLock.Unlock()
+
+				// Update pool metrics when session becomes idle
+				c.updatePoolMetrics()
 			}
 		}
 	}
@@ -183,6 +213,24 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 
 	session.Run()
 	return session, nil
+}
+
+// updatePoolMetrics reports current pool status to metrics callback
+func (c *Client) updatePoolMetrics() {
+	if c.metricsCallback == nil {
+		return
+	}
+
+	c.idleSessionLock.Lock()
+	idleCount := c.idleSession.Len()
+	c.idleSessionLock.Unlock()
+
+	c.sessionsLock.Lock()
+	totalCount := len(c.sessions)
+	c.sessionsLock.Unlock()
+
+	activeCount := totalCount - idleCount
+	c.metricsCallback.SessionPoolUpdate(idleCount, activeCount, totalCount)
 }
 
 func (c *Client) Close() error {
@@ -262,7 +310,19 @@ func (c *Client) idleCleanupExpTime(expTime time.Time) {
 	for i, s := range sessionToClose {
 		c.logger.Debug(fmt.Sprintf("[IdleCleanup] Closing session #%d (seq=%d, idle=%v, idleSince=%v)",
 			i+1, s.session.seq, s.idleTime, s.session.idleSince))
+
+		// Report session closure metrics
+		if c.metricsCallback != nil {
+			age := now.Sub(s.session.createdAt).Seconds()
+			c.metricsCallback.SessionClosed("idle_timeout", age)
+		}
+
 		s.session.Close()
+	}
+
+	// Update pool metrics after cleanup
+	if len(sessionToClose) > 0 {
+		c.updatePoolMetrics()
 	}
 }
 
@@ -292,6 +352,11 @@ func (c *Client) ensureIdleSessionPool() {
 		return
 	}
 
+	// Report deficit metrics
+	if c.metricsCallback != nil {
+		c.metricsCallback.EnsureIdleDeficit(deficit)
+	}
+
 	// Apply rate limiting if configured
 	toCreate := deficit
 	if c.ensureIdleSessionCreateRate > 0 && deficit > c.ensureIdleSessionCreateRate {
@@ -301,6 +366,11 @@ func (c *Client) ensureIdleSessionPool() {
 	} else {
 		c.logger.Debug(fmt.Sprintf("[EnsureIdleSession] Current idle sessions: %d, target: %d, creating %d new sessions",
 			currentIdleCount, c.ensureIdleSession, toCreate))
+	}
+
+	// Report how many we're creating this cycle
+	if c.metricsCallback != nil {
+		c.metricsCallback.EnsureIdleCreatedCycle(toCreate)
 	}
 
 	// Create sessions asynchronously to not block the periodic check
@@ -325,6 +395,12 @@ func (c *Client) ensureIdleSessionPool() {
 			session.idleSince = time.Now()
 			c.idleSession.Insert(math.MaxUint64-session.seq, session)
 			c.idleSessionLock.Unlock()
+
+			// Report session creation for ensure_idle
+			if c.metricsCallback != nil {
+				c.metricsCallback.SessionCreated("ensure_idle")
+				c.updatePoolMetrics()
+			}
 
 			c.logger.Debug(fmt.Sprintf("[EnsureIdleSession] Successfully created and pooled session #%d (seq=%d)",
 				index+1, session.seq))
@@ -417,8 +493,19 @@ func (c *Client) ageCleanup() {
 		c.idleSession.Remove(s.key)
 		c.logger.Debug(fmt.Sprintf("[AgeCleanup] Closing session #%d (seq=%d, age=%v, maxLife=%v, created=%v)",
 			i+1, s.session.seq, s.age, s.maxLife, s.session.createdAt))
+
+		// Report session closure metrics
+		if c.metricsCallback != nil {
+			c.metricsCallback.SessionClosed("max_age", s.age.Seconds())
+		}
+
 		// Close outside the lock to avoid blocking
 		go s.session.Close()
 	}
 	c.idleSessionLock.Unlock()
+
+	// Update pool metrics after cleanup
+	if len(sessionsToClose) > 0 {
+		c.updatePoolMetrics()
+	}
 }

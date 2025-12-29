@@ -16,6 +16,24 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 )
 
+// MetricsCallback provides hooks for reporting metrics
+type MetricsCallback interface {
+	// Session pool metrics
+	SessionPoolUpdate(idle, active, total int)
+	SessionCreated(reason string)
+	SessionClosed(reason string, ageSeconds float64)
+	SessionOldest(ageSeconds float64)
+
+	// Ensure idle session metrics
+	EnsureIdleDeficit(deficit int)
+	EnsureIdleCreatedCycle(count int)
+
+	// Stream metrics
+	StreamOpened()
+	StreamClosed()
+	StreamError()
+}
+
 type ClientConfig struct {
 	Password                    string
 	IdleSessionCheckInterval    time.Duration
@@ -29,6 +47,7 @@ type ClientConfig struct {
 	Heartbeat                   time.Duration
 	DialOut                     util.DialOutFunc
 	Logger                      logger.ContextLogger
+	MetricsCallback             MetricsCallback
 }
 
 type Client struct {
@@ -46,7 +65,7 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	}
 	// Initialize the padding state of this client
 	padding.UpdatePaddingScheme(padding.DefaultPaddingScheme, &c.padding)
-	c.sessionClient = session.NewClient(ctx, config.Logger, c.createOutboundConnection, &c.padding, config.IdleSessionCheckInterval, config.IdleSessionTimeout, config.MaxConnectionLifetime, config.ConnectionLifetimeJitter, config.MinIdleSession, config.MinIdleSessionForAge, config.EnsureIdleSession, config.EnsureIdleSessionCreateRate, config.Heartbeat)
+	c.sessionClient = session.NewClient(ctx, config.Logger, c.createOutboundConnection, &c.padding, config.IdleSessionCheckInterval, config.IdleSessionTimeout, config.MaxConnectionLifetime, config.ConnectionLifetimeJitter, config.MinIdleSession, config.MinIdleSessionForAge, config.EnsureIdleSession, config.EnsureIdleSessionCreateRate, config.Heartbeat, config.MetricsCallback)
 	return c, nil
 }
 
