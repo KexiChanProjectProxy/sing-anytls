@@ -361,10 +361,10 @@ func (c *Client) ensureIdleSessionPool() {
 	toCreate := deficit
 	if c.ensureIdleSessionCreateRate > 0 && deficit > c.ensureIdleSessionCreateRate {
 		toCreate = c.ensureIdleSessionCreateRate
-		c.logger.Debug(fmt.Sprintf("[EnsureIdleSession] Current idle sessions: %d, target: %d, deficit=%d, rate-limited to creating %d sessions (will create %d more in next cycle)",
+		c.logger.Trace(fmt.Sprintf("[EnsureIdleSession] Current idle sessions: %d, target: %d, deficit=%d, rate-limited to creating %d sessions (will create %d more in next cycle)",
 			currentIdleCount, c.ensureIdleSession, deficit, toCreate, deficit-toCreate))
 	} else {
-		c.logger.Debug(fmt.Sprintf("[EnsureIdleSession] Current idle sessions: %d, target: %d, creating %d new sessions",
+		c.logger.Trace(fmt.Sprintf("[EnsureIdleSession] Current idle sessions: %d, target: %d, creating %d new sessions",
 			currentIdleCount, c.ensureIdleSession, toCreate))
 	}
 
@@ -386,7 +386,7 @@ func (c *Client) ensureIdleSessionPool() {
 			// Create session with background context (not tied to any specific stream request)
 			session, err := c.createSession(context.Background())
 			if err != nil {
-				c.logger.Debug(fmt.Sprintf("[EnsureIdleSession] Failed to create session #%d: %v", index+1, err))
+				c.logger.Trace(fmt.Sprintf("[EnsureIdleSession] Failed to create session #%d: %v", index+1, err))
 				return
 			}
 
@@ -402,7 +402,7 @@ func (c *Client) ensureIdleSessionPool() {
 				c.updatePoolMetrics()
 			}
 
-			c.logger.Debug(fmt.Sprintf("[EnsureIdleSession] Successfully created and pooled session #%d (seq=%d)",
+			c.logger.Trace(fmt.Sprintf("[EnsureIdleSession] Successfully created and pooled session #%d (seq=%d)",
 				index+1, session.seq))
 		}(i)
 	}

@@ -374,7 +374,7 @@ func (s *Session) heartbeatLoop() {
 	import_time := time.Now().UnixNano()
 	jitter := time.Duration(import_time % int64(s.heartbeat/5))
 
-	s.logger.Debug(fmt.Sprintf("[Heartbeat][Session#%d] Starting heartbeat loop with %v interval (jitter: %v)", s.seq, s.heartbeat, jitter))
+	s.logger.Trace(fmt.Sprintf("[Heartbeat][Session#%d] Starting heartbeat loop with %v interval (jitter: %v)", s.seq, s.heartbeat, jitter))
 
 	// Wait for jitter before starting the ticker
 	time.Sleep(jitter)
@@ -390,17 +390,15 @@ func (s *Session) heartbeatLoop() {
 				return
 			}
 			heartbeatCount++
-			// Only log every 10th heartbeat at debug level, otherwise trace
-			if heartbeatCount%10 == 1 {
-				s.logger.Debug(fmt.Sprintf("[Heartbeat][Session#%d] Sending heartbeat #%d", s.seq, heartbeatCount))
-			}
+			// Log at trace level
+			s.logger.Trace(fmt.Sprintf("[Heartbeat][Session#%d] Sending heartbeat #%d", s.seq, heartbeatCount))
 			if _, err := s.writeControlFrame(newFrame(cmdHeartRequest, 0)); err != nil {
 				s.logger.Warn(fmt.Sprintf("[Heartbeat][Session#%d] Failed to send heartbeat #%d: %v", s.seq, heartbeatCount, err))
 				s.Close()
 				return
 			}
 		case <-s.die:
-			s.logger.Debug(fmt.Sprintf("[Heartbeat][Session#%d] Stopped after %d heartbeats", s.seq, heartbeatCount))
+			s.logger.Trace(fmt.Sprintf("[Heartbeat][Session#%d] Stopped after %d heartbeats", s.seq, heartbeatCount))
 			return
 		}
 	}
