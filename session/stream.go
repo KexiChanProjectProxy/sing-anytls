@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anytls/sing-anytls/pipe"
+	"github.com/KexiChanProjectProxy/sing-anytls/pipe"
 )
 
 // Stream implements net.Conn
