@@ -44,6 +44,15 @@ type Client struct {
 
 	logger          logger.Logger
 	metricsCallback MetricsCallback
+
+	statsHandler atomic.TypedValue[StatsHandler]
+}
+
+// SetStatsHandler makes sessions opened from now on ask the server for its
+// statistics and deliver them to handler. Sessions already open are not
+// affected.
+func (c *Client) SetStatsHandler(handler StatsHandler) {
+	c.statsHandler.Store(handler)
 }
 
 func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFunc,
@@ -188,6 +197,7 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 
 	session := NewClientSession(underlying, c.padding, c.logger, c.heartbeat)
 	session.seq = c.sessionCounter.Add(1)
+	session.statsHandler = c.statsHandler.Load()
 	session.createdAt = time.Now()
 
 	// Assign randomized lifetime if configured

@@ -70,6 +70,14 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	return c, nil
 }
 
+// SetStatsHandler makes sessions opened from now on ask the server for its view
+// of the connection, and delivers each report to handler with the number of
+// the session it describes. It is harmless against a server that does not
+// report: the request is ignored and handler is never called.
+func (c *Client) SetStatsHandler(handler session.StatsHandler) {
+	c.sessionClient.SetStatsHandler(handler)
+}
+
 func (c *Client) CreateProxy(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
 	conn, err := c.sessionClient.CreateStream(ctx)
 	if err != nil {

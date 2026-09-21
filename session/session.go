@@ -50,9 +50,36 @@ type Session struct {
 	buffer      []byte
 	pktCounter  atomic.Uint32
 	heartbeat   time.Duration
+	// statsHandler receives the server's statistics frames. The client only
+	// asks the server for them when it is set.
+	statsHandler StatsHandler
 
 	// server
 	onNewStream func(stream *Stream)
+	// statsProvider reports the server's view of the connection, and is nil
+	// when the server does not report statistics.
+	statsProvider StatsProvider
+}
+
+// StatsHandler receives a statistics frame for the client session numbered
+// seq. It is called from the session's receive loop and must not block.
+type StatsHandler func(seq uint64, stats util.StringMap)
+
+// StatsProvider reports the server's view of conn, or nil when it has nothing
+// to report. It is called periodically from a session's own goroutine.
+type StatsProvider func(conn net.Conn) util.StringMap
+
+// StatsInterval is how often a server reports statistics to a client that
+// asked for them.
+const StatsInterval = 10 * time.Second
+
+// statsInterval is StatsInterval, as a variable so that tests can shorten it.
+var statsInterval = StatsInterval
+
+// SetStatsProvider makes a server session report statistics to a client that
+// asks for them. It must be called before Run.
+func (s *Session) SetStatsProvider(provider StatsProvider) {
+	s.statsProvider = provider
 }
 
 func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.PaddingFactory], logger logger.Logger, heartbeat time.Duration) *Session {
@@ -91,6 +118,10 @@ func (s *Session) Run() {
 		"v":           "2",
 		"client":      util.Version,
 		"padding-md5": s.padding.Load().Md5,
+	}
+	if s.statsHandler != nil {
+		// Servers that do not know this key ignore it, like any other.
+		settings["stats"] = "1"
 	}
 	f := newFrame(cmdSettings, 0)
 	f.data = settings.ToBytes()
@@ -186,6 +217,7 @@ func (s *Session) recvLoop() error {
 	defer s.Close()
 
 	var receivedSettingsFromClient bool
+	var statsStarted bool
 	var hdr rawHeader
 
 	for {
@@ -304,6 +336,12 @@ func (s *Session) recvLoop() error {
 								buf.Put(buffer)
 								return err
 							}
+							// Statistics are only sent to a client that asked,
+							// and only once the client is known to be v2.
+							if m["stats"] == "1" && s.statsProvider != nil && !statsStarted {
+								statsStarted = true
+								go s.statsLoop()
+							}
 						}
 					}
 					buf.Put(buffer)
@@ -360,8 +398,26 @@ func (s *Session) recvLoop() error {
 					}
 					buf.Put(buffer)
 				}
+			case cmdStats:
+				if hdr.Length() > 0 {
+					buffer := buf.Get(int(hdr.Length()))
+					if _, err := io.ReadFull(s.conn, buffer); err != nil {
+						buf.Put(buffer)
+						return err
+					}
+					if s.isClient && s.statsHandler != nil {
+						s.statsHandler(s.seq, util.StringMapFromBytes(buffer))
+					}
+					buf.Put(buffer)
+				}
 			default:
-				// I don't know what command it is (can't have data)
+				// An unknown command is skipped along with its payload, so that
+				// a newer peer's frame cannot desynchronise the stream.
+				if hdr.Length() > 0 {
+					if _, err := io.CopyN(io.Discard, s.conn, int64(hdr.Length())); err != nil {
+						return err
+					}
+				}
 			}
 		} else {
 			return err
@@ -401,6 +457,29 @@ func (s *Session) heartbeatLoop() {
 		case <-s.die:
 			s.logger.Trace(fmt.Sprintf("[Heartbeat][Session#%d] Stopped after %d heartbeats", s.seq, heartbeatCount))
 			return
+		}
+	}
+}
+
+// statsLoop reports the server's view of the connection until the session
+// closes. A write failure closes the session, as a failed heartbeat does.
+func (s *Session) statsLoop() {
+	ticker := time.NewTicker(statsInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.die:
+			return
+		case <-ticker.C:
+			stats := s.statsProvider(s.conn)
+			if len(stats) == 0 {
+				continue
+			}
+			f := newFrame(cmdStats, 0)
+			f.data = stats.ToBytes()
+			if _, err := s.writeControlFrame(f); err != nil {
+				return
+			}
 		}
 	}
 }

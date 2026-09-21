@@ -26,6 +26,7 @@ type Service struct {
 	handler         N.TCPConnectionHandlerEx
 	fallbackHandler N.TCPConnectionHandlerEx
 	logger          logger.ContextLogger
+	statsProvider   session.StatsProvider
 }
 
 type ServiceConfig struct {
@@ -34,6 +35,9 @@ type ServiceConfig struct {
 	Handler         N.TCPConnectionHandlerEx
 	FallbackHandler N.TCPConnectionHandlerEx
 	Logger          logger.ContextLogger
+	// StatsProvider, when set, reports the server's view of a connection to
+	// clients that ask for it.
+	StatsProvider session.StatsProvider
 }
 
 type User struct {
@@ -46,6 +50,7 @@ func NewService(config ServiceConfig) (*Service, error) {
 		handler:         config.Handler,
 		fallbackHandler: config.FallbackHandler,
 		logger:          config.Logger,
+		statsProvider:   config.StatsProvider,
 		users:           make(map[[32]byte]string),
 	}
 
@@ -119,6 +124,7 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 
 		s.handler.NewConnectionEx(ctx, stream, source, destination, onClose)
 	}, &s.padding, s.logger)
+	session.SetStatsProvider(s.statsProvider)
 	session.Run()
 	session.Close()
 	return nil

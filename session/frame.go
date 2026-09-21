@@ -17,6 +17,10 @@ const ( // cmds
 	cmdHeartRequest   = 8  // Keep alive command
 	cmdHeartResponse  = 9  // Keep alive command
 	cmdServerSettings = 10 // Settings (Server send to client)
+	// cmdStats carries the server's view of the connection to the client. It
+	// is a fork extension: a server only sends it to a client that asked with
+	// "stats=1" in its settings, so a peer that does not know it never sees it.
+	cmdStats = 11
 )
 
 const (
