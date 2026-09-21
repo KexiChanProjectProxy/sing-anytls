@@ -235,6 +235,15 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 	}
 
 	c.sessionsLock.Lock()
+	select {
+	case <-c.die.Done():
+		// The client closed while this session was being dialed, after Close
+		// took its snapshot of sessions, so nothing else would close it.
+		c.sessionsLock.Unlock()
+		session.Close()
+		return nil, io.ErrClosedPipe
+	default:
+	}
 	c.sessions[session.seq] = session
 	c.sessionsLock.Unlock()
 
@@ -516,8 +525,14 @@ func (c *Client) ageCleanup() {
 
 	// Close sessions starting from oldest
 	c.idleSessionLock.Lock()
+	closed := 0
 	for i, s := range sessionsToClose {
-		c.idleSession.Remove(s.key)
+		// The lock was released after collecting, so a session may have been
+		// handed to a new stream since. Only close it if it is still idle.
+		if !c.idleSession.Remove(s.key) {
+			continue
+		}
+		closed++
 		c.logger.Debug(fmt.Sprintf("[AgeCleanup] Closing session #%d (seq=%d, age=%v, maxLife=%v, created=%v)",
 			i+1, s.session.seq, s.age, s.maxLife, s.session.createdAt))
 
@@ -532,7 +547,7 @@ func (c *Client) ageCleanup() {
 	c.idleSessionLock.Unlock()
 
 	// Update pool metrics after cleanup
-	if len(sessionsToClose) > 0 {
+	if closed > 0 {
 		c.updatePoolMetrics()
 	}
 }

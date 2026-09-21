@@ -469,7 +469,8 @@ func (s *Session) heartbeatLoop() {
 }
 
 // statsLoop reports the server's view of the connection until the session
-// closes. A write failure closes the session, as a failed heartbeat does.
+// closes. A write only fails when the connection itself has, which closes the
+// session as any other failed write does.
 func (s *Session) statsLoop() {
 	ticker := time.NewTicker(statsInterval)
 	defer ticker.Stop()
@@ -482,13 +483,29 @@ func (s *Session) statsLoop() {
 			if len(stats) == 0 {
 				continue
 			}
-			f := newFrame(cmdStats, 0)
-			f.data = stats.ToBytes()
-			if _, err := s.writeControlFrame(f); err != nil {
+			if err := s.writeStatsFrame(stats.ToBytes()); err != nil {
+				s.Close()
 				return
 			}
 		}
 	}
+}
+
+// writeStatsFrame sends a statistics frame without a write deadline.
+//
+// writeControlFrame puts a deadline on the whole connection, which would also
+// apply to a data write already blocked behind a client that stopped reading,
+// and so turn ordinary backpressure into a failed session. A report instead
+// waits its turn like a data frame; closing the session releases it.
+func (s *Session) writeStatsFrame(data []byte) error {
+	buffer := buf.NewSize(len(data) + headerOverHeadSize)
+	defer buffer.Release()
+	buffer.WriteByte(cmdStats)
+	binary.BigEndian.PutUint32(buffer.Extend(4), 0)
+	binary.BigEndian.PutUint16(buffer.Extend(2), uint16(len(data)))
+	buffer.Write(data)
+	_, err := s.writeConn(buffer.Bytes())
+	return err
 }
 
 func (s *Session) streamClosed(sid uint32) error {

@@ -315,3 +315,86 @@ func goroutineRunning(function string) bool {
 	buffer := make([]byte, 1<<20)
 	return strings.Contains(string(buffer[:runtime.Stack(buffer, true)]), function)
 }
+
+// A client that stops reading for longer than the control frame write
+// deadline must not lose its session because a statistics report was queued
+// behind the stalled data.
+func TestStatsReportDoesNotBreakBackpressure(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	pad := testPadding()
+	const total = 4 << 20
+	server := NewServerSession(serverConn, func(stream *Stream) {
+		defer stream.Close()
+		// Consume what the client sends, so that its first write completes.
+		go func() { _, _ = io.Copy(io.Discard, stream) }()
+		chunk := make([]byte, 32*1024)
+		for sent := 0; sent < total; sent += len(chunk) {
+			if _, err := stream.Write(chunk); err != nil {
+				return
+			}
+		}
+	}, pad, logger.NOP())
+	server.SetStatsProvider(func(net.Conn) util.StringMap {
+		return util.StringMap{"rtt_us": "1"}
+	})
+	go server.Run()
+	defer server.Close()
+
+	client := newTestClient(clientConn, pad)
+	defer client.Close()
+	client.SetStatsHandler(func(uint64, util.StringMap) {})
+	stream, err := client.CreateStream(context.Background())
+	if err != nil {
+		t.Fatalf("CreateStream: %v", err)
+	}
+	defer stream.Close()
+	if _, err = stream.Write([]byte("go")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	// Stall past the 5 second control frame deadline while reports queue up.
+	time.Sleep(6 * time.Second)
+	_ = stream.SetReadDeadline(time.Now().Add(20 * time.Second))
+	received, err := io.Copy(io.Discard, stream)
+	if received != total {
+		t.Fatalf("received %d of %d bytes after a stall (err %v)", received, total, err)
+	}
+}
+
+// A session whose dial completes after the client closed must be closed too:
+// Close has already taken its snapshot of sessions and would never see it.
+func TestSessionDialedAfterCloseIsClosed(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+	release := make(chan struct{})
+	client := NewClient(context.Background(), logger.NOP(), func(ctx context.Context) (net.Conn, error) {
+		<-release
+		return clientConn, nil
+	}, testPadding(), 0, 0, 0, 0, 0, 0, 0, 0, 0, false, nil)
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.createSession(context.Background())
+		result <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	client.Close()
+	close(release)
+	if err := <-result; err == nil {
+		t.Fatal("a session dialed after close was handed out")
+	}
+	// The underlying connection must have been closed.
+	_ = serverConn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := serverConn.Read(make([]byte, 1)); err == nil || isTimeout(err) {
+		t.Fatalf("connection left open after close: %v", err)
+	}
+	client.sessionsLock.Lock()
+	defer client.sessionsLock.Unlock()
+	if len(client.sessions) != 0 {
+		t.Fatalf("closed client still tracks %d sessions", len(client.sessions))
+	}
+}
+
+func isTimeout(err error) bool {
+	netErr, isNetErr := err.(net.Error)
+	return isNetErr && netErr.Timeout()
+}
