@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -285,4 +287,31 @@ func TestStatsNotSentToVersionOneClient(t *testing.T) {
 	if calls.Load() != 0 {
 		t.Fatalf("server reported %d times to a v1 client", calls.Load())
 	}
+}
+
+// Closing a client must stop its maintenance goroutine at once, not after the
+// next check interval.
+func TestClientCloseStopsMaintenanceLoop(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	client := NewClient(context.Background(), logger.NOP(), func(ctx context.Context) (net.Conn, error) {
+		return clientConn, nil
+	}, testPadding(), time.Hour, 0, 0, 0, 0, 0, 0, 0, 0, false, nil)
+	if !goroutineRunning("session.NewClient.func") {
+		t.Fatal("maintenance goroutine did not start")
+	}
+	client.Close()
+	deadline := time.Now().Add(time.Second)
+	for goroutineRunning("session.NewClient.func") {
+		if time.Now().After(deadline) {
+			t.Fatal("maintenance goroutine outlived the client")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func goroutineRunning(function string) bool {
+	buffer := make([]byte, 1<<20)
+	return strings.Contains(string(buffer[:runtime.Stack(buffer, true)]), function)
 }

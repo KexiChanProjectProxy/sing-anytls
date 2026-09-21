@@ -84,16 +84,20 @@ func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFu
 	c.idleSession = skiplist.NewSkipList[uint64, *Session]()
 	if !c.disableReuse {
 		go func() {
+			// Wait on the ticker and on close together, so that closing the
+			// client stops this goroutine at once rather than after the next
+			// check interval.
+			ticker := time.NewTicker(idleSessionCheckInterval)
+			defer ticker.Stop()
 			for {
-				time.Sleep(idleSessionCheckInterval)
-				c.idleCleanup()
-				c.ageCleanup()
-				c.ensureIdleSessionPool()
 				select {
 				case <-c.die.Done():
 					return
-				default:
+				case <-ticker.C:
 				}
+				c.idleCleanup()
+				c.ageCleanup()
+				c.ensureIdleSessionPool()
 			}
 		}()
 	}

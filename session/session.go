@@ -433,8 +433,15 @@ func (s *Session) heartbeatLoop() {
 
 	s.logger.Trace(fmt.Sprintf("[Heartbeat][Session#%d] Starting heartbeat loop with %v interval (jitter: %v)", s.seq, s.heartbeat, jitter))
 
-	// Wait for jitter before starting the ticker
-	time.Sleep(jitter)
+	// Wait for jitter before starting the ticker, returning at once if the
+	// session closes meanwhile.
+	jitterTimer := time.NewTimer(jitter)
+	select {
+	case <-jitterTimer.C:
+	case <-s.die:
+		jitterTimer.Stop()
+		return
+	}
 
 	ticker := time.NewTicker(s.heartbeat)
 	defer ticker.Stop()
