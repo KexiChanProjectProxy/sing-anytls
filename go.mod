@@ -1,4 +1,4 @@
-module github.com/KexiChanProjectProxy/sing-anytls
+module github.com/anytls/sing-anytls
 
 go 1.23.1
 

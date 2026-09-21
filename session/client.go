@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/KexiChanProjectProxy/sing-anytls/padding"
-	"github.com/KexiChanProjectProxy/sing-anytls/skiplist"
-	"github.com/KexiChanProjectProxy/sing-anytls/util"
+	"github.com/anytls/sing-anytls/internal/skiplist"
+	"github.com/anytls/sing-anytls/padding"
+	"github.com/anytls/sing-anytls/util"
 	"github.com/sagernet/sing/common/atomic"
 	"github.com/sagernet/sing/common/logger"
 )
@@ -40,13 +40,14 @@ type Client struct {
 	ensureIdleSession           int
 	ensureIdleSessionCreateRate int
 	heartbeat                   time.Duration
+	disableReuse                bool
 
 	logger          logger.Logger
 	metricsCallback MetricsCallback
 }
 
 func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFunc,
-	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout, maxConnectionLifetime, connectionLifetimeJitter time.Duration, minIdleSession, minIdleSessionForAge, ensureIdleSession, ensureIdleSessionCreateRate int, heartbeat time.Duration, metricsCallback MetricsCallback,
+	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout, maxConnectionLifetime, connectionLifetimeJitter time.Duration, minIdleSession, minIdleSessionForAge, ensureIdleSession, ensureIdleSessionCreateRate int, heartbeat time.Duration, disableReuse bool, metricsCallback MetricsCallback,
 ) *Client {
 	c := &Client{
 		sessions:                    make(map[uint64]*Session),
@@ -60,6 +61,7 @@ func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFu
 		ensureIdleSession:           ensureIdleSession,
 		ensureIdleSessionCreateRate: ensureIdleSessionCreateRate,
 		heartbeat:                   heartbeat,
+		disableReuse:                disableReuse,
 		logger:                      logger,
 		metricsCallback:             metricsCallback,
 	}
@@ -71,19 +73,21 @@ func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFu
 	}
 	c.die, c.dieCancel = context.WithCancel(ctx)
 	c.idleSession = skiplist.NewSkipList[uint64, *Session]()
-	go func() {
-		for {
-			time.Sleep(idleSessionCheckInterval)
-			c.idleCleanup()
-			c.ageCleanup()
-			c.ensureIdleSessionPool()
-			select {
-			case <-c.die.Done():
-				return
-			default:
+	if !c.disableReuse {
+		go func() {
+			for {
+				time.Sleep(idleSessionCheckInterval)
+				c.idleCleanup()
+				c.ageCleanup()
+				c.ensureIdleSessionPool()
+				select {
+				case <-c.die.Done():
+					return
+				default:
+				}
 			}
-		}
-	}()
+		}()
+	}
 	return c
 }
 
@@ -98,8 +102,10 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 	var stream *Stream
 	var err error
 
-	session = c.getIdleSession()
 	sessionCreated := false
+	if !c.disableReuse {
+		session = c.getIdleSession()
+	}
 	if session == nil {
 		session, err = c.createSession(ctx)
 		sessionCreated = true
@@ -139,10 +145,15 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 
 		// If Session is not closed, put this Stream to pool
 		if !session.IsClosed() {
+			if c.disableReuse {
+				session.Close()
+				return
+			}
+
 			select {
 			case <-c.die.Done():
 				// Now client has been closed
-				go session.Close()
+				session.Close()
 			default:
 				c.idleSessionLock.Lock()
 				session.idleSince = time.Now()
@@ -198,9 +209,11 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 	}
 
 	session.dieHook = func() {
-		c.idleSessionLock.Lock()
-		c.idleSession.Remove(math.MaxUint64 - session.seq)
-		c.idleSessionLock.Unlock()
+		if !c.disableReuse {
+			c.idleSessionLock.Lock()
+			c.idleSession.Remove(math.MaxUint64 - session.seq)
+			c.idleSessionLock.Unlock()
+		}
 
 		c.sessionsLock.Lock()
 		delete(c.sessions, session.seq)
@@ -261,9 +274,9 @@ func (c *Client) idleCleanupExpTime(expTime time.Time) {
 	now := time.Now()
 
 	type sessionInfo struct {
-		session   *Session
-		key       uint64
-		idleTime  time.Duration
+		session  *Session
+		key      uint64
+		idleTime time.Duration
 	}
 	var sessionToClose []sessionInfo
 

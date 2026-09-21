@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/KexiChanProjectProxy/sing-anytls/util"
+	"github.com/anytls/sing-anytls/util"
 	"github.com/sagernet/sing/common/atomic"
 )
 

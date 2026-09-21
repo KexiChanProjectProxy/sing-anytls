@@ -7,9 +7,9 @@ import (
 	"net"
 	"time"
 
-	"github.com/KexiChanProjectProxy/sing-anytls/padding"
-	"github.com/KexiChanProjectProxy/sing-anytls/session"
-	"github.com/KexiChanProjectProxy/sing-anytls/util"
+	"github.com/anytls/sing-anytls/padding"
+	"github.com/anytls/sing-anytls/session"
+	"github.com/anytls/sing-anytls/util"
 	"github.com/sagernet/sing/common/atomic"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/logger"
@@ -45,6 +45,7 @@ type ClientConfig struct {
 	EnsureIdleSession           int
 	EnsureIdleSessionCreateRate int
 	Heartbeat                   time.Duration
+	DisableReuse                bool
 	DialOut                     util.DialOutFunc
 	Logger                      logger.ContextLogger
 	MetricsCallback             MetricsCallback
@@ -65,7 +66,7 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	}
 	// Initialize the padding state of this client
 	padding.UpdatePaddingScheme(padding.DefaultPaddingScheme, &c.padding)
-	c.sessionClient = session.NewClient(ctx, config.Logger, c.createOutboundConnection, &c.padding, config.IdleSessionCheckInterval, config.IdleSessionTimeout, config.MaxConnectionLifetime, config.ConnectionLifetimeJitter, config.MinIdleSession, config.MinIdleSessionForAge, config.EnsureIdleSession, config.EnsureIdleSessionCreateRate, config.Heartbeat, config.MetricsCallback)
+	c.sessionClient = session.NewClient(ctx, config.Logger, c.createOutboundConnection, &c.padding, config.IdleSessionCheckInterval, config.IdleSessionTimeout, config.MaxConnectionLifetime, config.ConnectionLifetimeJitter, config.MinIdleSession, config.MinIdleSessionForAge, config.EnsureIdleSession, config.EnsureIdleSessionCreateRate, config.Heartbeat, config.DisableReuse, config.MetricsCallback)
 	return c, nil
 }
 
