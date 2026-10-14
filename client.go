@@ -48,10 +48,16 @@ type ClientConfig struct {
 	DisableReuse                bool
 	// ClientMetadata is sent to the server as the "client" setting verbatim.
 	// It is empty unless set.
-	ClientMetadata  string
-	DialOut         util.DialOutFunc
-	Logger          logger.ContextLogger
-	MetricsCallback MetricsCallback
+	ClientMetadata string
+	// CloseAfterIdle closes a session idle for longer than this, and
+	// CloseAfterLifetime stops reusing a session older than this (less up to a
+	// tenth at random) and closes it once idle. Both ignore the pool's
+	// protections and never interrupt a stream. Zero disables each.
+	CloseAfterIdle     time.Duration
+	CloseAfterLifetime time.Duration
+	DialOut            util.DialOutFunc
+	Logger             logger.ContextLogger
+	MetricsCallback    MetricsCallback
 }
 
 type Client struct {
@@ -70,6 +76,7 @@ func NewClient(ctx context.Context, config ClientConfig) (*Client, error) {
 	// Initialize the padding state of this client
 	padding.UpdatePaddingScheme(padding.DefaultPaddingScheme, &c.padding)
 	c.sessionClient = session.NewClient(ctx, config.Logger, c.createOutboundConnection, &c.padding, config.IdleSessionCheckInterval, config.IdleSessionTimeout, config.MaxConnectionLifetime, config.ConnectionLifetimeJitter, config.MinIdleSession, config.MinIdleSessionForAge, config.EnsureIdleSession, config.EnsureIdleSessionCreateRate, config.Heartbeat, config.DisableReuse, config.MetricsCallback, config.ClientMetadata)
+	c.sessionClient.SetSessionRetirement(config.CloseAfterIdle, config.CloseAfterLifetime)
 	return c, nil
 }
 

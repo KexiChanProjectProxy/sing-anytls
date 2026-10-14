@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"io"
 	"math"
 	"net"
 	"sync"
@@ -355,5 +356,130 @@ func TestIdleLatencyIsTheBestIdleSession(t *testing.T) {
 	}
 	if picked := client.getIdleSession(); picked.seq != 4 {
 		t.Fatalf("the reported latency is not the next pick's: picked seq %d", picked.seq)
+	}
+}
+
+func TestCloseAfterIdleIgnoresPoolProtection(t *testing.T) {
+	client := NewClient(context.Background(), logger.NOP(), nil, testPadding(),
+		time.Hour, time.Hour, 0, 0, 5, 0, 5, 0, 0, false, nil, "")
+	defer client.Close()
+	client.SetSessionRetirement(time.Second, 0)
+	now := time.Now()
+	stale := pooledSession(t, client, 1, 10*time.Millisecond, now.Add(-2*time.Second))
+	fresh := pooledSession(t, client, 2, 50*time.Millisecond, now.Add(-500*time.Millisecond))
+
+	client.retireCleanup()
+	if !stale.IsClosed() {
+		t.Fatal("a session idle past close_after_idle was kept by min_idle_session")
+	}
+	if fresh.IsClosed() {
+		t.Fatal("a session idle for less than close_after_idle was closed")
+	}
+	if client.idleSession.Len() != 1 {
+		t.Fatalf("idle sessions = %d, want 1", client.idleSession.Len())
+	}
+}
+
+func TestCloseAfterLifetimeIgnoresAgeProtection(t *testing.T) {
+	client := NewClient(context.Background(), logger.NOP(), nil, testPadding(),
+		time.Hour, time.Hour, 0, 0, 5, 5, 0, 0, 0, false, nil, "")
+	defer client.Close()
+	now := time.Now()
+	retired := pooledSession(t, client, 1, 10*time.Millisecond, now)
+	retired.retireAt = now.Add(-time.Second)
+	young := pooledSession(t, client, 2, 10*time.Millisecond, now)
+	young.retireAt = now.Add(time.Hour)
+	client.SetSessionRetirement(0, time.Hour)
+
+	client.retireCleanup()
+	if !retired.IsClosed() || young.IsClosed() {
+		t.Fatalf("retired closed=%v young closed=%v", retired.IsClosed(), young.IsClosed())
+	}
+}
+
+func TestRetiredSessionIsNeverHandedOut(t *testing.T) {
+	client := newLatencyClient(nil, 0, "")
+	defer client.Close()
+	now := time.Now()
+	best := pooledSession(t, client, 1, time.Millisecond, now)
+	best.retireAt = now.Add(-time.Millisecond)
+	next := pooledSession(t, client, 2, 30*time.Millisecond, now)
+
+	if latency, ok := client.IdleLatency(); !ok || latency != 30*time.Millisecond {
+		t.Fatalf("IdleLatency = %v, %v; the retired session must not count", latency, ok)
+	}
+	if picked := client.getIdleSession(); picked != next {
+		t.Fatalf("picked seq %d, want the non-retired session", picked.seq)
+	}
+	waitFor(t, "the retired session to close", best.IsClosed)
+	if client.idleSession.Len() != 0 {
+		t.Fatalf("idle sessions = %d, want 0", client.idleSession.Len())
+	}
+}
+
+// Retirement never interrupts a stream: the session keeps serving it and
+// closes once it ends, instead of returning to the pool.
+func TestRetirementWaitsForTheStream(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+	rawServer(t, serverConn, 0, 0)
+	client := newLatencyClient(clientConn, 0, "")
+	defer client.Close()
+	client.SetSessionRetirement(0, time.Hour)
+
+	stream, err := client.CreateStream(context.Background())
+	if err != nil {
+		t.Fatalf("CreateStream: %v", err)
+	}
+	session := anySession(client)
+	session.retireAt = time.Now().Add(-time.Second)
+	client.retireCleanup()
+	if session.IsClosed() {
+		t.Fatal("retirement closed a session that was carrying a stream")
+	}
+	if _, err = stream.Write([]byte("ping")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	reply := make([]byte, 4)
+	_ = stream.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err = io.ReadFull(stream, reply); err != nil || string(reply) != "ping" {
+		t.Fatalf("stream broken after retirement: %q, %v", reply, err)
+	}
+	stream.Close()
+	waitFor(t, "the retired session to close after its stream", session.IsClosed)
+	if client.idleSession.Len() != 0 {
+		t.Fatal("a retired session went back to the pool")
+	}
+}
+
+func TestRetirementLifetimeJitter(t *testing.T) {
+	const lifetime = 100 * time.Second
+	seen := make(map[time.Duration]bool)
+	for range 200 {
+		got := retirementLifetime(lifetime)
+		if got < 90*time.Second || got > lifetime {
+			t.Fatalf("lifetime %v outside [90s, 100s]", got)
+		}
+		seen[got] = true
+	}
+	if len(seen) < 2 {
+		t.Fatal("lifetimes are not jittered")
+	}
+}
+
+func TestCreatedSessionGetsRetirementDeadline(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+	rawServer(t, serverConn, 0, 0)
+	client := newLatencyClient(clientConn, 0, "")
+	defer client.Close()
+	client.SetSessionRetirement(0, time.Minute)
+	session, err := client.createSession(context.Background())
+	if err != nil {
+		t.Fatalf("createSession: %v", err)
+	}
+	life := session.retireAt.Sub(session.createdAt)
+	if life < 54*time.Second || life > time.Minute {
+		t.Fatalf("retirement after %v, want within [54s, 60s]", life)
 	}
 }

@@ -37,9 +37,11 @@ type Session struct {
 	seq         uint64
 	createdAt   time.Time
 	maxLifetime time.Duration
-	idleSince   time.Time
-	padding     *atomic.TypedValue[*padding.PaddingFactory]
-	logger      logger.Logger
+	// retireAt is the close_after_lifetime deadline, zero without one.
+	retireAt  time.Time
+	idleSince time.Time
+	padding   *atomic.TypedValue[*padding.PaddingFactory]
+	logger    logger.Logger
 
 	// peerVersion is written by recvLoop and read when streams open.
 	peerVersion atomic.Uint32

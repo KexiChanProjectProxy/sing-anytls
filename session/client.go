@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/rand/v2"
 	"net"
 	"slices"
 	"sync"
@@ -43,6 +44,10 @@ type Client struct {
 	heartbeat                   time.Duration
 	disableReuse                bool
 	clientMetadata              string
+	// closeAfterIdle and closeAfterLifetime retire sessions regardless of the
+	// pool's own limits and protections; zero disables each.
+	closeAfterIdle     time.Duration
+	closeAfterLifetime time.Duration
 
 	logger          logger.Logger
 	metricsCallback MetricsCallback
@@ -74,6 +79,9 @@ type SessionInfo struct {
 	// expired session is still used until age cleanup finds it idle.
 	MaxLifetime time.Duration
 	ExpiresAt   time.Time
+	// RetireAt is when the session stops being reused under
+	// close_after_lifetime, or zero without that limit.
+	RetireAt time.Time
 	// IdleSessions and TotalSessions describe the pool after the pick.
 	IdleSessions  int
 	TotalSessions int
@@ -91,6 +99,17 @@ func (i SessionInfo) LifetimeLeft(now time.Time) (time.Duration, bool) {
 		return 0, false
 	}
 	return i.ExpiresAt.Sub(now), true
+}
+
+// SetSessionRetirement sets two limits applied to every session regardless
+// of min_idle_session, ensure_idle_session and min_idle_session_for_age:
+// a session idle for longer than closeAfterIdle is closed, and a session older
+// than closeAfterLifetime, less up to a tenth of it at random, is no longer
+// handed out and closes once it is idle. Retirement never interrupts a stream.
+// Zero disables a limit. It must be called before the first stream.
+func (c *Client) SetSessionRetirement(closeAfterIdle, closeAfterLifetime time.Duration) {
+	c.closeAfterIdle = closeAfterIdle
+	c.closeAfterLifetime = closeAfterLifetime
 }
 
 // SetSelectHandler reports every stream's session to handler from now on.
@@ -146,6 +165,7 @@ func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFu
 					return
 				case <-ticker.C:
 				}
+				c.retireCleanup()
 				c.idleCleanup()
 				c.ageCleanup()
 				c.ensureIdleSessionPool()
@@ -222,6 +242,11 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 				session.Close()
 				return
 			}
+			if session.retired(time.Now()) {
+				// Its stream was the only thing keeping a retired session open.
+				c.closeRetired(session, retireReasonLifetime, "its stream ended")
+				return
+			}
 
 			select {
 			case <-c.die.Done():
@@ -251,9 +276,10 @@ func (c *Client) IdleLatency() (time.Duration, bool) {
 	defer c.idleSessionLock.Unlock()
 	var best time.Duration
 	found := false
+	now := time.Now()
 	for it := c.idleSession.Iterate(); it.IsNotEnd(); it.MoveToNext() {
 		session := it.Value()
-		if session.IsClosed() {
+		if session.IsClosed() || session.retired(now) {
 			continue
 		}
 		latency := session.Latency()
@@ -272,10 +298,16 @@ func (c *Client) IdleLatency() (time.Duration, bool) {
 func (c *Client) getIdleSession() (idle *Session) {
 	c.idleSessionLock.Lock()
 	var idleKey uint64
+	var retired []*Session
+	now := time.Now()
 	for it := c.idleSession.Iterate(); it.IsNotEnd(); it.MoveToNext() {
 		session := it.Value()
 		// A closed session is removed by its dieHook shortly; never hand it out.
 		if session.IsClosed() {
+			continue
+		}
+		if session.retired(now) {
+			retired = append(retired, session)
 			continue
 		}
 		if idle == nil || preferred(session, idle) {
@@ -285,8 +317,14 @@ func (c *Client) getIdleSession() (idle *Session) {
 	if idle != nil {
 		c.idleSession.Remove(idleKey)
 	}
+	for _, session := range retired {
+		c.idleSession.Remove(math.MaxUint64 - session.seq)
+	}
 	idleCount := c.idleSession.Len()
 	c.idleSessionLock.Unlock()
+	for _, session := range retired {
+		c.closeRetired(session, retireReasonLifetime, "idle "+now.Sub(session.idleSince).String())
+	}
 	if idle != nil {
 		latency := idle.Latency()
 		c.logger.Trace(fmt.Sprintf("[Pool] Picked session seq=%d (srtt=%v, samples=%d, idle left=%d)",
@@ -334,6 +372,7 @@ func (c *Client) sessionInfo(session *Session, reused bool, idleFor time.Duratio
 		Streams:     streams,
 		CreatedAt:   session.createdAt,
 		MaxLifetime: session.maxLifetime,
+		RetireAt:    session.retireAt,
 	}
 	if session.maxLifetime > 0 {
 		info.ExpiresAt = session.createdAt.Add(session.maxLifetime)
@@ -357,6 +396,9 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 	session.seq = c.sessionCounter.Add(1)
 	session.statsHandler = c.statsHandler.Load()
 	session.createdAt = time.Now()
+	if c.closeAfterLifetime > 0 {
+		session.retireAt = session.createdAt.Add(retirementLifetime(c.closeAfterLifetime))
+	}
 
 	// Assign randomized lifetime if configured
 	if c.maxConnectionLifetime > 0 {
@@ -724,5 +766,74 @@ func compareRetirement(a Latency, aCreated time.Time, b Latency, bCreated time.T
 		return 1
 	default:
 		return aCreated.Compare(bCreated)
+	}
+}
+
+// Reasons a session is retired, as reported to logs and metrics.
+const (
+	retireReasonIdle     = "close_after_idle"
+	retireReasonLifetime = "close_after_lifetime"
+)
+
+// retirementLifetime draws a session's lifetime under close_after_lifetime
+// uniformly from [0.9, 1] of it, so that sessions created together, such as an
+// ensure_idle_session batch, do not all retire at once.
+func retirementLifetime(lifetime time.Duration) time.Duration {
+	jitter := lifetime / 10
+	if jitter <= 0 {
+		return lifetime
+	}
+	return lifetime - rand.N(jitter+1)
+}
+
+// retired reports whether the session has reached its close_after_lifetime
+// deadline and must no longer be handed out.
+func (s *Session) retired(now time.Time) bool {
+	return !s.retireAt.IsZero() && !now.Before(s.retireAt)
+}
+
+// closeRetired closes a session that is not in the idle pool and logs why;
+// state says whether it was idle and for how long, or that its stream ended.
+func (c *Client) closeRetired(session *Session, reason string, state string) {
+	age := time.Since(session.createdAt)
+	latency := session.Latency()
+	c.logger.Debug(fmt.Sprintf("[RetireCleanup] Closing session seq=%d (reason=%s, age=%v, %s, latency=%v, samples=%d)",
+		session.seq, reason, age, state, latency.Smoothed, latency.Samples))
+	if c.metricsCallback != nil {
+		c.metricsCallback.SessionClosed(reason, age.Seconds())
+	}
+	session.Close()
+	c.updatePoolMetrics()
+}
+
+// retireCleanup closes idle sessions past close_after_lifetime or idle for
+// longer than close_after_idle, ignoring every pool protection. It runs before
+// the other maintenance so that ensure_idle_session refills in the same pass.
+func (c *Client) retireCleanup() {
+	if c.closeAfterIdle <= 0 && c.closeAfterLifetime <= 0 {
+		return
+	}
+	type retiring struct {
+		session *Session
+		reason  string
+	}
+	var closing []retiring
+	now := time.Now()
+	c.idleSessionLock.Lock()
+	for it := c.idleSession.Iterate(); it.IsNotEnd(); it.MoveToNext() {
+		session := it.Value()
+		switch {
+		case session.retired(now):
+			closing = append(closing, retiring{session, retireReasonLifetime})
+		case c.closeAfterIdle > 0 && now.Sub(session.idleSince) > c.closeAfterIdle:
+			closing = append(closing, retiring{session, retireReasonIdle})
+		}
+	}
+	for _, s := range closing {
+		c.idleSession.Remove(math.MaxUint64 - s.session.seq)
+	}
+	c.idleSessionLock.Unlock()
+	for _, s := range closing {
+		c.closeRetired(s.session, s.reason, "idle "+now.Sub(s.session.idleSince).String())
 	}
 }
