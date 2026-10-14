@@ -483,3 +483,52 @@ func TestCreatedSessionGetsRetirementDeadline(t *testing.T) {
 		t.Fatalf("retirement after %v, want within [54s, 60s]", life)
 	}
 }
+
+func TestConnectionLifetimeJitterIsRandomAndBounded(t *testing.T) {
+	const lifetime, jitter = 300 * time.Second, 10 * time.Second
+	low, high := lifetime, lifetime
+	seen := make(map[time.Duration]bool)
+	for range 1000 {
+		got := jitteredLifetime(lifetime, jitter)
+		if got < lifetime-jitter || got > lifetime+jitter {
+			t.Fatalf("lifetime %v outside %v ± %v", got, lifetime, jitter)
+		}
+		low, high = min(low, got), max(high, got)
+		seen[got] = true
+	}
+	// The old formula gave lifetime-jitter/2 to every session.
+	if len(seen) < 900 {
+		t.Fatalf("only %d distinct lifetimes in 1000 draws", len(seen))
+	}
+	if low > lifetime-jitter/2 || high < lifetime+jitter/2 {
+		t.Fatalf("draws span only [%v, %v]; they should cover most of ±%v", low, high, jitter)
+	}
+	if got := jitteredLifetime(lifetime, 0); got != lifetime {
+		t.Fatalf("no jitter changed the lifetime to %v", got)
+	}
+	if got := jitteredLifetime(500*time.Millisecond, 0); got != time.Second {
+		t.Fatalf("lifetime below a second = %v, want 1s", got)
+	}
+}
+
+func TestCreatedSessionsGetDifferentLifetimes(t *testing.T) {
+	client := NewClient(context.Background(), logger.NOP(), func(ctx context.Context) (net.Conn, error) {
+		clientConn, serverConn := net.Pipe()
+		t.Cleanup(func() { serverConn.Close() })
+		rawServer(t, serverConn, 0, 0)
+		return clientConn, nil
+	}, testPadding(), time.Hour, time.Hour, 300*time.Second, 10*time.Second, 0, 0, 0, 0, 0, false, nil, "")
+	defer client.Close()
+	// The old formula spread consecutive sessions by microseconds.
+	low, high := time.Duration(math.MaxInt64), time.Duration(0)
+	for range 20 {
+		session, err := client.createSession(context.Background())
+		if err != nil {
+			t.Fatalf("createSession: %v", err)
+		}
+		low, high = min(low, session.maxLifetime), max(high, session.maxLifetime)
+	}
+	if high-low < 5*time.Second {
+		t.Fatalf("20 sessions span only %v of a ±10s jitter", high-low)
+	}
+}

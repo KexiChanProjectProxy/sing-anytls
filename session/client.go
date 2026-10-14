@@ -400,22 +400,8 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 		session.retireAt = session.createdAt.Add(retirementLifetime(c.closeAfterLifetime))
 	}
 
-	// Assign randomized lifetime if configured
 	if c.maxConnectionLifetime > 0 {
-		if c.connectionLifetimeJitter > 0 {
-			// Calculate random lifetime: base ± jitter
-			// Use session.seq as seed for deterministic but varied randomness
-			jitterNanos := c.connectionLifetimeJitter.Nanoseconds()
-			// Random value in range [-jitter, +jitter]
-			randomJitter := time.Duration((int64(session.seq)*31337)%jitterNanos - jitterNanos/2)
-			session.maxLifetime = c.maxConnectionLifetime + randomJitter
-			// Ensure lifetime is positive
-			if session.maxLifetime < time.Second {
-				session.maxLifetime = time.Second
-			}
-		} else {
-			session.maxLifetime = c.maxConnectionLifetime
-		}
+		session.maxLifetime = jitteredLifetime(c.maxConnectionLifetime, c.connectionLifetimeJitter)
 	}
 
 	session.dieHook = func() {
@@ -836,4 +822,21 @@ func (c *Client) retireCleanup() {
 	for _, s := range closing {
 		c.closeRetired(s.session, s.reason, "idle "+now.Sub(s.session.idleSince).String())
 	}
+}
+
+// jitteredLifetime draws a session's max_connection_lifetime uniformly from
+// [lifetime-jitter, lifetime+jitter], and never below one second.
+//
+// It used to offset by seq*31337 nanoseconds modulo the jitter, less half of
+// it. For any realistic seq that product is a few microseconds, far below a
+// jitter in seconds, so every session got lifetime-jitter/2 and sessions
+// created together still expired together.
+func jitteredLifetime(lifetime, jitter time.Duration) time.Duration {
+	if jitter > 0 {
+		lifetime += rand.N(2*jitter+1) - jitter
+	}
+	if lifetime < time.Second {
+		lifetime = time.Second
+	}
+	return lifetime
 }
