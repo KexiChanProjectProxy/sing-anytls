@@ -333,3 +333,27 @@ func TestSelectHandlerReportsSession(t *testing.T) {
 		t.Fatalf("pool counts: %+v", second)
 	}
 }
+
+func TestIdleLatencyIsTheBestIdleSession(t *testing.T) {
+	client := newLatencyClient(nil, 0, "")
+	defer client.Close()
+	if _, ok := client.IdleLatency(); ok {
+		t.Fatal("an empty pool reported a latency")
+	}
+	client.idleSession.Insert(math.MaxUint64-1, idleTestSession(1, 0))
+	if _, ok := client.IdleLatency(); ok {
+		t.Fatal("an unmeasured pool reported a latency")
+	}
+	closed := idleTestSession(2, time.Millisecond)
+	close(closed.die)
+	client.idleSession.Insert(math.MaxUint64-2, closed)
+	client.idleSession.Insert(math.MaxUint64-3, idleTestSession(3, 30*time.Millisecond))
+	client.idleSession.Insert(math.MaxUint64-4, idleTestSession(4, 20*time.Millisecond))
+	latency, ok := client.IdleLatency()
+	if !ok || latency != 20*time.Millisecond {
+		t.Fatalf("IdleLatency = %v, %v, want 20ms", latency, ok)
+	}
+	if picked := client.getIdleSession(); picked.seq != 4 {
+		t.Fatalf("the reported latency is not the next pick's: picked seq %d", picked.seq)
+	}
+}

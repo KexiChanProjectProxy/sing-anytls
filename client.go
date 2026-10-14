@@ -81,6 +81,12 @@ func (c *Client) SetStatsHandler(handler session.StatsHandler) {
 	c.sessionClient.SetStatsHandler(handler)
 }
 
+// IdleLatency returns the latency of the session a new connection would use,
+// the lowest among measured idle sessions, or false when there is none.
+func (c *Client) IdleLatency() (time.Duration, bool) {
+	return c.sessionClient.IdleLatency()
+}
+
 // SetSelectHandler reports the session each new stream is placed on.
 func (c *Client) SetSelectHandler(handler session.SelectHandler) {
 	c.sessionClient.SetSelectHandler(handler)

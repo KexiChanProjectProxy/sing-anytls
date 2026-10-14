@@ -242,6 +242,31 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 	return stream, nil
 }
 
+// IdleLatency returns the smoothed latency of the session the next stream
+// would be placed on: the lowest among measured idle sessions. It returns false
+// when no idle session has been measured, in which case the next stream would
+// take an unmeasured session or dial a new one.
+func (c *Client) IdleLatency() (time.Duration, bool) {
+	c.idleSessionLock.Lock()
+	defer c.idleSessionLock.Unlock()
+	var best time.Duration
+	found := false
+	for it := c.idleSession.Iterate(); it.IsNotEnd(); it.MoveToNext() {
+		session := it.Value()
+		if session.IsClosed() {
+			continue
+		}
+		latency := session.Latency()
+		if latency.Samples == 0 {
+			continue
+		}
+		if !found || latency.Smoothed < best {
+			best, found = latency.Smoothed, true
+		}
+	}
+	return best, found
+}
+
 // getIdleSession takes the preferred idle session out of the pool: the one
 // with the lowest measured latency, or the newest when none is measured.
 func (c *Client) getIdleSession() (idle *Session) {
