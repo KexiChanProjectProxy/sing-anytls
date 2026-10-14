@@ -191,21 +191,28 @@ func (s *Session) OpenStream() (*Stream, error) {
 		s.synDoneLock.Unlock()
 	}
 
+	// Register the stream before announcing it, so that a reply the server
+	// sends straight after the SYN finds it.
+	s.streamLock.Lock()
+	select {
+	case <-s.die:
+		s.streamLock.Unlock()
+		return nil, io.ErrClosedPipe
+	default:
+		s.streams[sid] = stream
+	}
+	s.streamLock.Unlock()
+
 	if _, err := s.writeControlFrame(newFrame(cmdSYN, sid)); err != nil {
+		s.streamLock.Lock()
+		delete(s.streams, sid)
+		s.streamLock.Unlock()
 		return nil, err
 	}
 
 	s.buffering = false // proxy Write it's SocksAddr to flush the buffer
 
-	s.streamLock.Lock()
-	defer s.streamLock.Unlock()
-	select {
-	case <-s.die:
-		return nil, io.ErrClosedPipe
-	default:
-		s.streams[sid] = stream
-		return stream, nil
-	}
+	return stream, nil
 }
 
 func (s *Session) recvLoop() error {
