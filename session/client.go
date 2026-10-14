@@ -47,7 +47,55 @@ type Client struct {
 	logger          logger.Logger
 	metricsCallback MetricsCallback
 
-	statsHandler atomic.TypedValue[StatsHandler]
+	statsHandler  atomic.TypedValue[StatsHandler]
+	selectHandler atomic.TypedValue[SelectHandler]
+}
+
+// SelectHandler is told which session a new stream was placed on. It is
+// called from CreateStream with the caller's context and must not block.
+type SelectHandler func(ctx context.Context, info SessionInfo)
+
+// SessionInfo describes the session a stream was placed on, as it was when
+// the stream opened.
+type SessionInfo struct {
+	// Seq numbers the client's sessions from 1.
+	Seq uint64
+	// Reused is true when the session came from the idle pool, false when it
+	// was dialed for this stream.
+	Reused bool
+	// IdleFor is how long a reused session sat in the pool.
+	IdleFor time.Duration
+	Latency Latency
+	// Streams counts the streams opened on the session, this one included.
+	Streams   uint64
+	CreatedAt time.Time
+	// MaxLifetime is the session's max_connection_lifetime with jitter, and
+	// ExpiresAt the time it is reached; both are zero without a limit. An
+	// expired session is still used until age cleanup finds it idle.
+	MaxLifetime time.Duration
+	ExpiresAt   time.Time
+	// IdleSessions and TotalSessions describe the pool after the pick.
+	IdleSessions  int
+	TotalSessions int
+}
+
+// Age is how long the session has existed at now.
+func (i SessionInfo) Age(now time.Time) time.Duration {
+	return now.Sub(i.CreatedAt)
+}
+
+// LifetimeLeft is the time until ExpiresAt, negative once it has passed, and
+// false without a lifetime limit.
+func (i SessionInfo) LifetimeLeft(now time.Time) (time.Duration, bool) {
+	if i.ExpiresAt.IsZero() {
+		return 0, false
+	}
+	return i.ExpiresAt.Sub(now), true
+}
+
+// SetSelectHandler reports every stream's session to handler from now on.
+func (c *Client) SetSelectHandler(handler SelectHandler) {
+	c.selectHandler.Store(handler)
 }
 
 // SetStatsHandler makes sessions opened from now on ask the server for its
@@ -119,8 +167,12 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 	var err error
 
 	sessionCreated := false
+	var idleFor time.Duration
 	if !c.disableReuse {
 		session = c.getIdleSession()
+		if session != nil {
+			idleFor = time.Since(session.idleSince)
+		}
 	}
 	if session == nil {
 		session, err = c.createSession(ctx)
@@ -148,9 +200,14 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 		return nil, fmt.Errorf("failed to create stream: %w", err)
 	}
 
+	streams := session.streamsOpened.Add(1)
+
 	// Report stream opened
 	if c.metricsCallback != nil {
 		c.metricsCallback.StreamOpened()
+	}
+	if handler := c.selectHandler.Load(); handler != nil {
+		handler(ctx, c.sessionInfo(session, !sessionCreated, idleFor, streams))
 	}
 
 	stream.dieHook = func() {
@@ -241,6 +298,28 @@ func comparePreference(aSeq uint64, a Latency, bSeq uint64, b Latency) int {
 	default:
 		return 0
 	}
+}
+
+func (c *Client) sessionInfo(session *Session, reused bool, idleFor time.Duration, streams uint64) SessionInfo {
+	info := SessionInfo{
+		Seq:         session.seq,
+		Reused:      reused,
+		IdleFor:     idleFor,
+		Latency:     session.Latency(),
+		Streams:     streams,
+		CreatedAt:   session.createdAt,
+		MaxLifetime: session.maxLifetime,
+	}
+	if session.maxLifetime > 0 {
+		info.ExpiresAt = session.createdAt.Add(session.maxLifetime)
+	}
+	c.idleSessionLock.Lock()
+	info.IdleSessions = c.idleSession.Len()
+	c.idleSessionLock.Unlock()
+	c.sessionsLock.Lock()
+	info.TotalSessions = len(c.sessions)
+	c.sessionsLock.Unlock()
+	return info
 }
 
 func (c *Client) createSession(ctx context.Context) (*Session, error) {

@@ -280,3 +280,56 @@ func TestIdleCleanupProtectsLowestLatency(t *testing.T) {
 		t.Fatal("the protected session's idle time was not reset")
 	}
 }
+
+type selectContextKey struct{}
+
+func TestSelectHandlerReportsSession(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+	rawServer(t, serverConn, 0, 0)
+	client := NewClient(context.Background(), logger.NOP(), func(ctx context.Context) (net.Conn, error) {
+		return clientConn, nil
+	}, testPadding(), time.Hour, time.Hour, time.Hour, 0, 0, 0, 0, 0, 0, false, nil, "")
+	defer client.Close()
+	reports := make(chan SessionInfo, 4)
+	client.SetSelectHandler(func(ctx context.Context, info SessionInfo) {
+		if ctx.Value(selectContextKey{}) != "caller" {
+			t.Error("handler did not get the caller's context")
+		}
+		reports <- info
+	})
+	ctx := context.WithValue(context.Background(), selectContextKey{}, "caller")
+
+	open := func() SessionInfo {
+		stream, err := client.CreateStream(ctx)
+		if err != nil {
+			t.Fatalf("CreateStream: %v", err)
+		}
+		info := <-reports
+		stream.Close()
+		return info
+	}
+	first := open()
+	if first.Reused || first.Streams != 1 || first.Seq != 1 {
+		t.Fatalf("first stream: %+v", first)
+	}
+	if first.MaxLifetime != time.Hour || !first.ExpiresAt.Equal(first.CreatedAt.Add(time.Hour)) {
+		t.Fatalf("lifetime not reported: %+v", first)
+	}
+	if left, ok := first.LifetimeLeft(time.Now()); !ok || left <= 59*time.Minute {
+		t.Fatalf("lifetime left = %v, %v", left, ok)
+	}
+	waitFor(t, "the session to return to the pool", func() bool {
+		client.idleSessionLock.Lock()
+		defer client.idleSessionLock.Unlock()
+		return client.idleSession.Len() == 1
+	})
+	waitFor(t, "the settings sample", func() bool { return anySession(client).Latency().Samples > 0 })
+	second := open()
+	if !second.Reused || second.Streams != 2 || second.Seq != 1 || second.Latency.Samples == 0 {
+		t.Fatalf("second stream: %+v", second)
+	}
+	if second.IdleSessions != 0 || second.TotalSessions != 1 {
+		t.Fatalf("pool counts: %+v", second)
+	}
+}

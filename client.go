@@ -81,6 +81,11 @@ func (c *Client) SetStatsHandler(handler session.StatsHandler) {
 	c.sessionClient.SetStatsHandler(handler)
 }
 
+// SetSelectHandler reports the session each new stream is placed on.
+func (c *Client) SetSelectHandler(handler session.SelectHandler) {
+	c.sessionClient.SetSelectHandler(handler)
+}
+
 func (c *Client) CreateProxy(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
 	conn, err := c.sessionClient.CreateStream(ctx)
 	if err != nil {
