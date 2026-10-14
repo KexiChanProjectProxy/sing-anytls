@@ -46,10 +46,18 @@ type Session struct {
 	// client
 	isClient    bool
 	sendPadding bool
-	buffering   bool
-	buffer      []byte
 	pktCounter  atomic.Uint32
 	heartbeat   time.Duration
+	// clientMetadata is sent as the "client" setting verbatim.
+	clientMetadata string
+	// Latency measurement. Each timestamp is written by one goroutine and
+	// consumed by recvLoop; the results are read by the pool. Timestamps are
+	// monoNow values, zero when nothing is outstanding.
+	settingsSentAt  atomic.Int64
+	heartbeatSentAt atomic.Int64
+	latencySmoothed atomic.Int64
+	latencyLast     atomic.Int64
+	latencySamples  atomic.Uint32
 	// statsHandler receives the server's statistics frames. The client only
 	// asks the server for them when it is set.
 	statsHandler StatsHandler
@@ -82,14 +90,15 @@ func (s *Session) SetStatsProvider(provider StatsProvider) {
 	s.statsProvider = provider
 }
 
-func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.PaddingFactory], logger logger.Logger, heartbeat time.Duration) *Session {
+func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.PaddingFactory], logger logger.Logger, heartbeat time.Duration, clientMetadata string) *Session {
 	s := &Session{
-		conn:        conn,
-		isClient:    true,
-		sendPadding: true,
-		padding:     _padding,
-		logger:      logger,
-		heartbeat:   heartbeat,
+		conn:           conn,
+		isClient:       true,
+		sendPadding:    true,
+		padding:        _padding,
+		logger:         logger,
+		heartbeat:      heartbeat,
+		clientMetadata: clientMetadata,
 	}
 	s.die = make(chan struct{})
 	s.streams = make(map[uint32]*Stream)
@@ -116,7 +125,7 @@ func (s *Session) Run() {
 
 	settings := util.StringMap{
 		"v":           "2",
-		"client":      util.Version,
+		"client":      s.clientMetadata,
 		"padding-md5": s.padding.Load().Md5,
 	}
 	if s.statsHandler != nil {
@@ -125,10 +134,18 @@ func (s *Session) Run() {
 	}
 	f := newFrame(cmdSettings, 0)
 	f.data = settings.ToBytes()
-	s.buffering = true
-	s.writeControlFrame(f)
-
+	// The receive loop starts first, so that the server's answer is read
+	// even while the settings write is still in progress.
 	go s.recvLoop()
+
+	// The settings frame goes out at once rather than with the first stream,
+	// so that the server's answer measures the session's latency before it is
+	// used, and so that heartbeats of an idle session really reach the server.
+	// A failed write closes the session, which stops the receive loop.
+	s.settingsSentAt.Store(monoNow())
+	if _, err := s.writeControlFrame(f); err != nil {
+		return
+	}
 
 	// Start heartbeat goroutine if enabled
 	if s.heartbeat > 0 {
@@ -209,9 +226,6 @@ func (s *Session) OpenStream() (*Stream, error) {
 		s.streamLock.Unlock()
 		return nil, err
 	}
-
-	s.buffering = false // proxy Write it's SocksAddr to flush the buffer
-
 	return stream, nil
 }
 
@@ -387,8 +401,11 @@ func (s *Session) recvLoop() error {
 					return err
 				}
 			case cmdHeartResponse:
-				// Client side: received response, connection is alive (no need to log)
-				break
+				if s.isClient {
+					if sent := s.heartbeatSentAt.Swap(0); sent != 0 {
+						s.recordLatency(time.Duration(monoNow()-sent), "heartbeat")
+					}
+				}
 			case cmdServerSettings:
 				if hdr.Length() > 0 {
 					buffer := buf.Get(int(hdr.Length()))
@@ -397,6 +414,9 @@ func (s *Session) recvLoop() error {
 						return err
 					}
 					if s.isClient {
+						if sent := s.settingsSentAt.Swap(0); sent != 0 {
+							s.recordLatency(time.Duration(monoNow()-sent), "settings")
+						}
 						// check server's version
 						m := util.StringMapFromBytes(buffer)
 						if v, err := strconv.Atoi(m["v"]); err == nil {
@@ -463,7 +483,7 @@ func (s *Session) heartbeatLoop() {
 			heartbeatCount++
 			// Log at trace level
 			s.logger.Trace(fmt.Sprintf("[Heartbeat][Session#%d] Sending heartbeat #%d", s.seq, heartbeatCount))
-			if _, err := s.writeControlFrame(newFrame(cmdHeartRequest, 0)); err != nil {
+			if err := s.sendHeartbeat(); err != nil {
 				s.logger.Warn(fmt.Sprintf("[Heartbeat][Session#%d] Failed to send heartbeat #%d: %v", s.seq, heartbeatCount, err))
 				s.Close()
 				return
@@ -473,6 +493,67 @@ func (s *Session) heartbeatLoop() {
 			return
 		}
 	}
+}
+
+// sendHeartbeat writes a heartbeat request and times it. While an earlier
+// request is still unanswered its timestamp is kept, because the next response
+// belongs to it: the server answers requests in the order they arrive.
+func (s *Session) sendHeartbeat() error {
+	s.heartbeatSentAt.CompareAndSwap(0, monoNow())
+	_, err := s.writeControlFrame(newFrame(cmdHeartRequest, 0))
+	return err
+}
+
+// epoch anchors monoNow, so that timestamps kept in atomics stay monotonic.
+var epoch = time.Now()
+
+func monoNow() int64 {
+	return int64(time.Since(epoch))
+}
+
+// Latency is a client session's end-to-end round trip time, measured from the
+// settings exchange when the session opens and from every heartbeat after.
+// Both are answered by the server itself, apart from any proxied destination,
+// so any version 2 server can be measured.
+type Latency struct {
+	// Smoothed is an exponentially weighted moving average of the samples,
+	// weighted like TCP's smoothed RTT.
+	Smoothed time.Duration
+	// Last is the most recent sample.
+	Last time.Duration
+	// Samples counts the samples taken; Smoothed and Last are meaningless
+	// while it is zero.
+	Samples uint32
+}
+
+// Latency returns what is known of the session's latency.
+func (s *Session) Latency() Latency {
+	return Latency{
+		Smoothed: time.Duration(s.latencySmoothed.Load()),
+		Last:     time.Duration(s.latencyLast.Load()),
+		Samples:  s.latencySamples.Load(),
+	}
+}
+
+// recordLatency adds a sample. It is only called from recvLoop, so updates do
+// not race with each other; a reader may see the count and the average one
+// update apart, which is harmless.
+func (s *Session) recordLatency(sample time.Duration, source string) {
+	if sample < 0 {
+		sample = 0
+	}
+	s.latencyLast.Store(int64(sample))
+	if s.latencySamples.Load() == 0 {
+		s.latencySmoothed.Store(int64(sample))
+		s.latencySamples.Add(1)
+		s.logger.Debug(fmt.Sprintf("[Latency][Session#%d] first sample %v (%s)", s.seq, sample, source))
+		return
+	}
+	smoothed := time.Duration(s.latencySmoothed.Load())
+	smoothed += (sample - smoothed) / 8
+	s.latencySmoothed.Store(int64(smoothed))
+	s.latencySamples.Add(1)
+	s.logger.Trace(fmt.Sprintf("[Latency][Session#%d] sample %v (%s), srtt=%v", s.seq, sample, source, smoothed))
 }
 
 // statsLoop reports the server's view of the connection until the session
@@ -601,14 +682,6 @@ func (s *Session) writeControlFrame(frame frame) (int, error) {
 func (s *Session) writeConn(b []byte) (n int, err error) {
 	s.connLock.Lock()
 	defer s.connLock.Unlock()
-
-	if s.buffering {
-		s.buffer = slices.Concat(s.buffer, b)
-		return len(b), nil
-	} else if len(s.buffer) > 0 {
-		b = slices.Concat(s.buffer, b)
-		s.buffer = nil
-	}
 
 	// calulate & send padding
 	if s.sendPadding {

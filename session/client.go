@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -41,6 +42,7 @@ type Client struct {
 	ensureIdleSessionCreateRate int
 	heartbeat                   time.Duration
 	disableReuse                bool
+	clientMetadata              string
 
 	logger          logger.Logger
 	metricsCallback MetricsCallback
@@ -56,7 +58,7 @@ func (c *Client) SetStatsHandler(handler StatsHandler) {
 }
 
 func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFunc,
-	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout, maxConnectionLifetime, connectionLifetimeJitter time.Duration, minIdleSession, minIdleSessionForAge, ensureIdleSession, ensureIdleSessionCreateRate int, heartbeat time.Duration, disableReuse bool, metricsCallback MetricsCallback,
+	_padding *atomic.TypedValue[*padding.PaddingFactory], idleSessionCheckInterval, idleSessionTimeout, maxConnectionLifetime, connectionLifetimeJitter time.Duration, minIdleSession, minIdleSessionForAge, ensureIdleSession, ensureIdleSessionCreateRate int, heartbeat time.Duration, disableReuse bool, metricsCallback MetricsCallback, clientMetadata string,
 ) *Client {
 	c := &Client{
 		sessions:                    make(map[uint64]*Session),
@@ -71,6 +73,7 @@ func NewClient(ctx context.Context, logger logger.Logger, dialOut util.DialOutFu
 		ensureIdleSessionCreateRate: ensureIdleSessionCreateRate,
 		heartbeat:                   heartbeat,
 		disableReuse:                disableReuse,
+		clientMetadata:              clientMetadata,
 		logger:                      logger,
 		metricsCallback:             metricsCallback,
 	}
@@ -182,15 +185,62 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 	return stream, nil
 }
 
+// getIdleSession takes the preferred idle session out of the pool: the one
+// with the lowest measured latency, or the newest when none is measured.
 func (c *Client) getIdleSession() (idle *Session) {
 	c.idleSessionLock.Lock()
-	if !c.idleSession.IsEmpty() {
-		it := c.idleSession.Iterate()
-		idle = it.Value()
-		c.idleSession.Remove(it.Key())
+	var idleKey uint64
+	for it := c.idleSession.Iterate(); it.IsNotEnd(); it.MoveToNext() {
+		session := it.Value()
+		// A closed session is removed by its dieHook shortly; never hand it out.
+		if session.IsClosed() {
+			continue
+		}
+		if idle == nil || preferred(session, idle) {
+			idle, idleKey = session, it.Key()
+		}
 	}
+	if idle != nil {
+		c.idleSession.Remove(idleKey)
+	}
+	idleCount := c.idleSession.Len()
 	c.idleSessionLock.Unlock()
+	if idle != nil {
+		latency := idle.Latency()
+		c.logger.Trace(fmt.Sprintf("[Pool] Picked session seq=%d (srtt=%v, samples=%d, idle left=%d)",
+			idle.seq, latency.Smoothed, latency.Samples, idleCount))
+	}
 	return
+}
+
+// preferred reports whether a should be handed out before b. A measured
+// session comes before an unmeasured one, then the lower smoothed latency, and
+// between equals the newer session, which is the order without measurements.
+func preferred(a, b *Session) bool {
+	return comparePreference(a.seq, a.Latency(), b.seq, b.Latency()) < 0
+}
+
+// comparePreference orders sessions from most to least preferred.
+func comparePreference(aSeq uint64, a Latency, bSeq uint64, b Latency) int {
+	aMeasured, bMeasured := a.Samples > 0, b.Samples > 0
+	switch {
+	case aMeasured != bMeasured:
+		if aMeasured {
+			return -1
+		}
+		return 1
+	case aMeasured && a.Smoothed != b.Smoothed:
+		if a.Smoothed < b.Smoothed {
+			return -1
+		}
+		return 1
+	case aSeq > bSeq:
+		return -1
+	case aSeq < bSeq:
+		return 1
+	default:
+		return 0
+	}
 }
 
 func (c *Client) createSession(ctx context.Context) (*Session, error) {
@@ -199,7 +249,7 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 		return nil, err
 	}
 
-	session := NewClientSession(underlying, c.padding, c.logger, c.heartbeat)
+	session := NewClientSession(underlying, c.padding, c.logger, c.heartbeat, c.clientMetadata)
 	session.seq = c.sessionCounter.Add(1)
 	session.statsHandler = c.statsHandler.Load()
 	session.createdAt = time.Now()
@@ -292,51 +342,53 @@ func (c *Client) idleCleanup() {
 }
 
 func (c *Client) idleCleanupExpTime(expTime time.Time) {
-	activeCount := 0
-	protectedCount := 0
 	now := time.Now()
 
 	type sessionInfo struct {
 		session  *Session
 		key      uint64
 		idleTime time.Duration
+		latency  Latency
 	}
-	var sessionToClose []sessionInfo
+	var expired []sessionInfo
+	activeCount := 0
 
 	c.idleSessionLock.Lock()
 	currentIdleCount := c.idleSession.Len()
-	it := c.idleSession.Iterate()
-	for it.IsNotEnd() {
+	for it := c.idleSession.Iterate(); it.IsNotEnd(); it.MoveToNext() {
 		session := it.Value()
-		key := it.Key()
-		it.MoveToNext()
-
 		if !session.idleSince.Before(expTime) {
 			activeCount++
 			continue
 		}
-
-		if activeCount < c.minIdleSession {
-			session.idleSince = time.Now()
-			activeCount++
-			protectedCount++
-			continue
-		}
-
-		sessionToClose = append(sessionToClose, sessionInfo{
+		expired = append(expired, sessionInfo{
 			session:  session,
-			key:      key,
+			key:      it.Key(),
 			idleTime: now.Sub(session.idleSince),
+			latency:  session.Latency(),
 		})
-		c.idleSession.Remove(key)
+	}
+
+	// min_idle_session keeps the preferred expired sessions: the lowest
+	// latency ones, which are also the ones streams are placed on.
+	slices.SortFunc(expired, func(a, b sessionInfo) int {
+		return comparePreference(a.session.seq, a.latency, b.session.seq, b.latency)
+	})
+	protectedCount := min(max(c.minIdleSession-activeCount, 0), len(expired))
+	for _, s := range expired[:protectedCount] {
+		s.session.idleSince = now
+	}
+	sessionToClose := expired[protectedCount:]
+	for _, s := range sessionToClose {
+		c.idleSession.Remove(s.key)
 	}
 	c.idleSessionLock.Unlock()
 
 	// Log cleanup activity if there are sessions to close or sessions were protected
 	if len(sessionToClose) > 0 || protectedCount > 0 {
 		if protectedCount > 0 {
-			c.logger.Debug(fmt.Sprintf("[IdleCleanup] Found %d expired sessions (timeout=%v), closing %d (keeping %d to maintain min_idle_session=%d, current=%d)",
-				len(sessionToClose)+protectedCount, c.idleSessionTimeout, len(sessionToClose), protectedCount, c.minIdleSession, currentIdleCount))
+			c.logger.Debug(fmt.Sprintf("[IdleCleanup] Found %d expired sessions (timeout=%v), closing %d (keeping %d lowest-latency to maintain min_idle_session=%d, current=%d)",
+				len(expired), c.idleSessionTimeout, len(sessionToClose), protectedCount, c.minIdleSession, currentIdleCount))
 		} else {
 			c.logger.Debug(fmt.Sprintf("[IdleCleanup] Found %d expired sessions (timeout=%v), closing all (current=%d)",
 				len(sessionToClose), c.idleSessionTimeout, currentIdleCount))
@@ -344,8 +396,8 @@ func (c *Client) idleCleanupExpTime(expTime time.Time) {
 	}
 
 	for i, s := range sessionToClose {
-		c.logger.Debug(fmt.Sprintf("[IdleCleanup] Closing session #%d (seq=%d, idle=%v, idleSince=%v)",
-			i+1, s.session.seq, s.idleTime, s.session.idleSince))
+		c.logger.Debug(fmt.Sprintf("[IdleCleanup] Closing session #%d (seq=%d, idle=%v, idleSince=%v, latency=%v, samples=%d)",
+			i+1, s.session.seq, s.idleTime, s.session.idleSince, s.latency.Smoothed, s.latency.Samples))
 
 		// Report session closure metrics
 		if c.metricsCallback != nil {
@@ -445,7 +497,8 @@ func (c *Client) ensureIdleSessionPool() {
 }
 
 // ageCleanup closes idle sessions that have exceeded their maximum lifetime.
-// Older connections are prioritized for closure, while respecting min_idle_session.
+// The highest-latency ones are closed first, unmeasured ones before them and
+// the oldest between equals, while respecting min_idle_session_for_age.
 func (c *Client) ageCleanup() {
 	// Feature disabled if maxConnectionLifetime is 0
 	if c.maxConnectionLifetime <= 0 {
@@ -460,6 +513,7 @@ func (c *Client) ageCleanup() {
 		createdAt time.Time
 		age       time.Duration
 		maxLife   time.Duration
+		latency   Latency
 	}
 
 	var expiredSessions []sessionToClose
@@ -484,6 +538,7 @@ func (c *Client) ageCleanup() {
 					createdAt: session.createdAt,
 					age:       age,
 					maxLife:   session.maxLifetime,
+					latency:   session.Latency(),
 				})
 			}
 		}
@@ -495,15 +550,11 @@ func (c *Client) ageCleanup() {
 		return
 	}
 
-	// Sort by creation time (oldest first)
-	// Since we want to close older connections first, sort in ascending order by createdAt
-	for i := 0; i < len(expiredSessions)-1; i++ {
-		for j := i + 1; j < len(expiredSessions); j++ {
-			if expiredSessions[i].createdAt.After(expiredSessions[j].createdAt) {
-				expiredSessions[i], expiredSessions[j] = expiredSessions[j], expiredSessions[i]
-			}
-		}
-	}
+	// Order by retirement: unmeasured first, then the highest latency, then
+	// the oldest. The sessions kept are the ones streams are placed on.
+	slices.SortFunc(expiredSessions, func(a, b sessionToClose) int {
+		return compareRetirement(a.latency, a.createdAt, b.latency, b.createdAt)
+	})
 
 	// Calculate how many sessions we can safely close while respecting min_idle_session_for_age
 	maxCanClose := currentIdleCount - c.minIdleSessionForAge
@@ -520,7 +571,7 @@ func (c *Client) ageCleanup() {
 		keptCount = len(expiredSessions) - maxCanClose
 	}
 
-	c.logger.Debug(fmt.Sprintf("[AgeCleanup] Found %d expired sessions, closing %d oldest (keeping %d to maintain min_idle_session_for_age=%d)",
+	c.logger.Debug(fmt.Sprintf("[AgeCleanup] Found %d expired sessions, closing %d highest-latency (keeping %d to maintain min_idle_session_for_age=%d)",
 		len(expiredSessions), len(sessionsToClose), keptCount, c.minIdleSessionForAge))
 
 	// Close sessions starting from oldest
@@ -533,8 +584,8 @@ func (c *Client) ageCleanup() {
 			continue
 		}
 		closed++
-		c.logger.Debug(fmt.Sprintf("[AgeCleanup] Closing session #%d (seq=%d, age=%v, maxLife=%v, created=%v)",
-			i+1, s.session.seq, s.age, s.maxLife, s.session.createdAt))
+		c.logger.Debug(fmt.Sprintf("[AgeCleanup] Closing session #%d (seq=%d, age=%v, maxLife=%v, created=%v, latency=%v, samples=%d)",
+			i+1, s.session.seq, s.age, s.maxLife, s.session.createdAt, s.latency.Smoothed, s.latency.Samples))
 
 		// Report session closure metrics
 		if c.metricsCallback != nil {
@@ -549,5 +600,25 @@ func (c *Client) ageCleanup() {
 	// Update pool metrics after cleanup
 	if closed > 0 {
 		c.updatePoolMetrics()
+	}
+}
+
+// compareRetirement orders sessions from first to last to close: unmeasured
+// before measured, then higher smoothed latency first, then older first.
+func compareRetirement(a Latency, aCreated time.Time, b Latency, bCreated time.Time) int {
+	aMeasured, bMeasured := a.Samples > 0, b.Samples > 0
+	switch {
+	case aMeasured != bMeasured:
+		if !aMeasured {
+			return -1
+		}
+		return 1
+	case aMeasured && a.Smoothed != b.Smoothed:
+		if a.Smoothed > b.Smoothed {
+			return -1
+		}
+		return 1
+	default:
+		return aCreated.Compare(bCreated)
 	}
 }

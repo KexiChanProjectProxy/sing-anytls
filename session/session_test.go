@@ -30,7 +30,7 @@ func TestStreamWriteOver64KiB(t *testing.T) {
 
 	clientSess := NewClient(context.Background(), logger.NOP(), func(ctx context.Context) (net.Conn, error) {
 		return cli, nil
-	}, &pad, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, nil)
+	}, &pad, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, nil, "")
 	defer clientSess.Close()
 
 	const N = 256 * 1024 // 4× max frame payload, forces splitting

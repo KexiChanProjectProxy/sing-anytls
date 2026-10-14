@@ -32,7 +32,7 @@ func testPadding() *singAtomic.TypedValue[*padding.PaddingFactory] {
 func newTestClient(conn net.Conn, pad *singAtomic.TypedValue[*padding.PaddingFactory]) *Client {
 	return NewClient(context.Background(), logger.NOP(), func(ctx context.Context) (net.Conn, error) {
 		return conn, nil
-	}, pad, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, nil)
+	}, pad, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, nil, "")
 }
 
 // echoServer starts a server session that answers every stream by echoing it.
@@ -297,7 +297,7 @@ func TestClientCloseStopsMaintenanceLoop(t *testing.T) {
 	defer clientConn.Close()
 	client := NewClient(context.Background(), logger.NOP(), func(ctx context.Context) (net.Conn, error) {
 		return clientConn, nil
-	}, testPadding(), time.Hour, 0, 0, 0, 0, 0, 0, 0, 0, false, nil)
+	}, testPadding(), time.Hour, 0, 0, 0, 0, 0, 0, 0, 0, false, nil, "")
 	if !goroutineRunning("session.NewClient.func") {
 		t.Fatal("maintenance goroutine did not start")
 	}
@@ -369,7 +369,7 @@ func TestSessionDialedAfterCloseIsClosed(t *testing.T) {
 	client := NewClient(context.Background(), logger.NOP(), func(ctx context.Context) (net.Conn, error) {
 		<-release
 		return clientConn, nil
-	}, testPadding(), 0, 0, 0, 0, 0, 0, 0, 0, 0, false, nil)
+	}, testPadding(), 0, 0, 0, 0, 0, 0, 0, 0, 0, false, nil, "")
 
 	result := make(chan error, 1)
 	go func() {
