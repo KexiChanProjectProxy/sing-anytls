@@ -72,6 +72,9 @@ type Session struct {
 	// statsProvider reports the server's view of the connection, and is nil
 	// when the server does not report statistics.
 	statsProvider StatsProvider
+	// draining stops the session accepting streams and closes it once the
+	// streams it already has are gone.
+	draining atomic.Bool
 }
 
 // StatsHandler receives a statistics frame for the client session numbered
@@ -155,6 +158,36 @@ func (s *Session) Run() {
 	// Start heartbeat goroutine if enabled
 	if s.heartbeat > 0 {
 		go s.heartbeatLoop()
+	}
+}
+
+// SetCloseHook makes a server session call hook once, when it closes. It must
+// be called before Run. The session pool sets the same hook on client sessions
+// itself, so this is for servers only.
+func (s *Session) SetCloseHook(hook func()) {
+	s.dieHook = hook
+}
+
+// Drain makes a server session stop accepting streams. It closes at once if it
+// has no stream, otherwise when its last stream ends. A stream the client opens
+// meanwhile closes the session, and every stream still on it, so that a client
+// pooling the session finds out and stops using it.
+func (s *Session) Drain() {
+	s.draining.Store(true)
+	s.closeIfDrained()
+}
+
+// closeIfDrained closes a draining session that has no stream left. The caller
+// must not hold streamLock.
+func (s *Session) closeIfDrained() {
+	if !s.draining.Load() {
+		return
+	}
+	s.streamLock.RLock()
+	idle := len(s.streams) == 0
+	s.streamLock.RUnlock()
+	if idle {
+		s.Close()
 	}
 }
 
@@ -278,6 +311,13 @@ func (s *Session) recvLoop() error {
 					return nil
 				}
 				s.streamLock.Lock()
+				// Checked under the lock: Drain sets the flag before it counts
+				// the streams and Close marks the session before it clears them,
+				// so neither can miss a stream added here.
+				if s.draining.Load() || s.IsClosed() {
+					s.streamLock.Unlock()
+					return nil
+				}
 				if _, ok := s.streams[sid]; !ok {
 					stream := newStream(sid, s)
 					s.streams[sid] = stream
@@ -320,6 +360,7 @@ func (s *Session) recvLoop() error {
 				if ok {
 					stream.closeLocally()
 				}
+				s.closeIfDrained()
 			case cmdWaste:
 				if hdr.Length() > 0 {
 					buffer := buf.Get(int(hdr.Length()))
@@ -609,6 +650,7 @@ func (s *Session) streamClosed(sid uint32) error {
 	s.streamLock.Lock()
 	delete(s.streams, sid)
 	s.streamLock.Unlock()
+	s.closeIfDrained()
 	return err
 }
 
