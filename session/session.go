@@ -67,11 +67,17 @@ type Session struct {
 	// asks the server for them when it is set.
 	statsHandler StatsHandler
 
+	// dnsClient is the client half of in-session DNS, nil on a server.
+	dnsClient *dnsClientState
+
 	// server
 	onNewStream func(stream *Stream)
 	// statsProvider reports the server's view of the connection, and is nil
 	// when the server does not report statistics.
 	statsProvider StatsProvider
+	// dnsServer answers clients' DNS queries, and is nil when the server does
+	// not offer DNS.
+	dnsServer *dnsServerState
 }
 
 // StatsHandler receives a statistics frame for the client session numbered
@@ -104,6 +110,10 @@ func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.Paddin
 		logger:         logger,
 		heartbeat:      heartbeat,
 		clientMetadata: clientMetadata,
+		dnsClient: &dnsClientState{
+			ready:   make(chan struct{}),
+			pending: make(map[uint32]chan dnsResult),
+		},
 	}
 	s.die = make(chan struct{})
 	s.streams = make(map[uint32]*Stream)
@@ -187,6 +197,7 @@ func (s *Session) Close() error {
 		}
 		s.streams = make(map[uint32]*Stream)
 		s.streamLock.Unlock()
+		s.failPendingDNS()
 		return s.conn.Close()
 	} else {
 		return io.ErrClosedPipe
@@ -354,9 +365,14 @@ func (s *Session) recvLoop() error {
 							s.peerVersion.Store(uint32(byte(v)))
 							// send cmdServerSettings
 							f := newFrame(cmdServerSettings, 0)
-							f.data = util.StringMap{
+							serverSettings := util.StringMap{
 								"v": "2",
-							}.ToBytes()
+							}
+							if s.dnsServer != nil {
+								// Clients that do not know this key ignore it.
+								serverSettings["dns"] = "1"
+							}
+							f.data = serverSettings.ToBytes()
 							_, err = s.writeControlFrame(f)
 							if err != nil {
 								buf.Put(buffer)
@@ -427,6 +443,7 @@ func (s *Session) recvLoop() error {
 						if v, err := strconv.Atoi(m["v"]); err == nil {
 							s.peerVersion.Store(uint32(byte(v)))
 						}
+						s.markServerSettings(m["dns"] == "1")
 					}
 					buf.Put(buffer)
 				}
@@ -441,6 +458,21 @@ func (s *Session) recvLoop() error {
 						s.statsHandler(s.seq, util.StringMapFromBytes(buffer))
 					}
 					buf.Put(buffer)
+				}
+			case cmdDNSRequest, cmdDNSResponse:
+				// The payload is handed to another goroutine, so it does not
+				// come from the shared buffer pool.
+				var payload []byte
+				if hdr.Length() > 0 {
+					payload = make([]byte, int(hdr.Length()))
+					if _, err := io.ReadFull(s.conn, payload); err != nil {
+						return err
+					}
+				}
+				if hdr.Cmd() == cmdDNSRequest {
+					s.handleDNSRequest(sid, payload)
+				} else {
+					s.handleDNSResponse(sid, payload)
 				}
 			default:
 				// An unknown command is skipped along with its payload, so that
@@ -576,7 +608,7 @@ func (s *Session) statsLoop() {
 			if len(stats) == 0 {
 				continue
 			}
-			if err := s.writeStatsFrame(stats.ToBytes()); err != nil {
+			if err := s.writeAsyncFrame(cmdStats, 0, stats.ToBytes()); err != nil {
 				s.Close()
 				return
 			}
@@ -584,17 +616,18 @@ func (s *Session) statsLoop() {
 	}
 }
 
-// writeStatsFrame sends a statistics frame without a write deadline.
+// writeAsyncFrame sends a frame the server produces on its own goroutine,
+// such as a statistics report or a DNS answer, without a write deadline.
 //
 // writeControlFrame puts a deadline on the whole connection, which would also
 // apply to a data write already blocked behind a client that stopped reading,
-// and so turn ordinary backpressure into a failed session. A report instead
-// waits its turn like a data frame; closing the session releases it.
-func (s *Session) writeStatsFrame(data []byte) error {
+// and so turn ordinary backpressure into a failed session. Such a frame
+// instead waits its turn like a data frame; closing the session releases it.
+func (s *Session) writeAsyncFrame(cmd byte, sid uint32, data []byte) error {
 	buffer := buf.NewSize(len(data) + headerOverHeadSize)
 	defer buffer.Release()
-	buffer.WriteByte(cmdStats)
-	binary.BigEndian.PutUint32(buffer.Extend(4), 0)
+	buffer.WriteByte(cmd)
+	binary.BigEndian.PutUint32(buffer.Extend(4), sid)
 	binary.BigEndian.PutUint16(buffer.Extend(2), uint16(len(data)))
 	buffer.Write(data)
 	_, err := s.writeConn(buffer.Bytes())

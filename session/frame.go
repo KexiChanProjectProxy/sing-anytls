@@ -21,6 +21,13 @@ const ( // cmds
 	// is a fork extension: a server only sends it to a client that asked with
 	// "stats=1" in its settings, so a peer that does not know it never sees it.
 	cmdStats = 11
+	// cmdDNSRequest carries a DNS message from a client and cmdDNSResponse the
+	// server's answer, matched by the request id in the stream id field. They
+	// are a fork extension: a client only sends a request to a server that
+	// offered "dns=1" in its settings, and a server only answers requests, so
+	// a peer that does not know them never sees them.
+	cmdDNSRequest  = 12
+	cmdDNSResponse = 13
 )
 
 const (

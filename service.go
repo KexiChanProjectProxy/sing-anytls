@@ -27,6 +27,7 @@ type Service struct {
 	fallbackHandler N.TCPConnectionHandlerEx
 	logger          logger.ContextLogger
 	statsProvider   session.StatsProvider
+	dnsHandler      session.DNSHandler
 }
 
 type ServiceConfig struct {
@@ -38,6 +39,9 @@ type ServiceConfig struct {
 	// StatsProvider, when set, reports the server's view of a connection to
 	// clients that ask for it.
 	StatsProvider session.StatsProvider
+	// DNSHandler, when set, makes the server offer DNS to clients and answer
+	// their in-session queries. Its context carries the authenticated user.
+	DNSHandler session.DNSHandler
 }
 
 type User struct {
@@ -51,6 +55,7 @@ func NewService(config ServiceConfig) (*Service, error) {
 		fallbackHandler: config.FallbackHandler,
 		logger:          config.Logger,
 		statsProvider:   config.StatsProvider,
+		dnsHandler:      config.DNSHandler,
 		users:           make(map[[32]byte]string),
 	}
 
@@ -125,6 +130,11 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 		s.handler.NewConnectionEx(ctx, stream, source, destination, onClose)
 	}, &s.padding, s.logger)
 	session.SetStatsProvider(s.statsProvider)
+	if s.dnsHandler != nil {
+		dnsCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		session.SetDNSHandler(dnsCtx, s.dnsHandler)
+	}
 	session.Run()
 	session.Close()
 	return nil

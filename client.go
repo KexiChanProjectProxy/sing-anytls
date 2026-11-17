@@ -99,6 +99,19 @@ func (c *Client) SetSelectHandler(handler session.SelectHandler) {
 	c.sessionClient.SetSelectHandler(handler)
 }
 
+// ExchangeDNS sends a DNS message to the server and returns its answer. It
+// returns ErrDNSUnsupported when the server does not offer DNS.
+func (c *Client) ExchangeDNS(ctx context.Context, request []byte) ([]byte, error) {
+	return c.sessionClient.ExchangeDNS(ctx, request)
+}
+
+// Errors returned by ExchangeDNS.
+var (
+	ErrDNSUnsupported     = session.ErrDNSUnsupported
+	ErrDNSServerFailed    = session.ErrDNSServerFailed
+	ErrDNSMessageTooLarge = session.ErrDNSMessageTooLarge
+)
+
 func (c *Client) CreateProxy(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
 	conn, err := c.sessionClient.CreateStream(ctx)
 	if err != nil {
