@@ -307,7 +307,9 @@ func (c *Client) getIdleSession() (idle *Session) {
 			continue
 		}
 		if session.retired(now) {
-			retired = append(retired, session)
+			if !session.dnsBusy() {
+				retired = append(retired, session)
+			}
 			continue
 		}
 		if idle == nil || preferred(session, idle) {
@@ -489,7 +491,8 @@ func (c *Client) idleCleanupExpTime(expTime time.Time) {
 	currentIdleCount := c.idleSession.Len()
 	for it := c.idleSession.Iterate(); it.IsNotEnd(); it.MoveToNext() {
 		session := it.Value()
-		if !session.idleSince.Before(expTime) {
+		if !session.idleSince.Before(expTime) || session.dnsBusy() {
+			// A session with DNS queries in flight is in use.
 			activeCount++
 			continue
 		}
@@ -809,6 +812,9 @@ func (c *Client) retireCleanup() {
 	for it := c.idleSession.Iterate(); it.IsNotEnd(); it.MoveToNext() {
 		session := it.Value()
 		switch {
+		case session.dnsBusy():
+			// Retirement never interrupts a DNS query, as it never
+			// interrupts a stream.
 		case session.retired(now):
 			closing = append(closing, retiring{session, retireReasonLifetime})
 		case c.closeAfterIdle > 0 && now.Sub(session.idleSince) > c.closeAfterIdle:

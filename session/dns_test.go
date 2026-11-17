@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -437,4 +438,276 @@ func TestDNSDoesNotTakeSessionFromPool(t *testing.T) {
 	if n := len(servers()); n != 1 {
 		t.Fatalf("used %d sessions, want streams and DNS to share one", n)
 	}
+}
+
+// A DNS query sent while a stream write is stalled by backpressure must honour
+// its own deadline and must not put a deadline on the connection that fails
+// the stalled stream.
+func TestDNSRequestDoesNotBreakBackpressure(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	pad := testPadding()
+	release := make(chan struct{})
+	received := make(chan int64, 1)
+	server := NewServerSession(serverConn, func(stream *Stream) {
+		<-release
+		n, _ := io.Copy(io.Discard, stream)
+		received <- n
+	}, pad, logger.NOP())
+	server.SetDNSHandler(context.Background(), echoDNS)
+	go server.Run()
+	defer server.Close()
+
+	client := newTestClient(clientConn, pad)
+	defer client.Close()
+	if _, err := client.ExchangeDNS(testContext(t), []byte("warm")); err != nil {
+		t.Fatalf("warm-up query: %v", err)
+	}
+	stream, err := client.CreateStream(context.Background())
+	if err != nil {
+		t.Fatalf("CreateStream: %v", err)
+	}
+	const total = 4 << 20
+	uploaded := make(chan error, 1)
+	go func() {
+		_, err := stream.Write(make([]byte, total))
+		stream.Close()
+		uploaded <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = client.ExchangeDNS(ctx, []byte("stalled"))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("query behind a stalled stream: %v, want DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("query took %v, past its own deadline", elapsed)
+	}
+
+	// Stall past the 5 second control frame deadline.
+	time.Sleep(6 * time.Second)
+	close(release)
+	if err := <-uploaded; err != nil {
+		t.Fatalf("stalled upload failed: %v", err)
+	}
+	if n := <-received; n != total {
+		t.Fatalf("server received %d of %d bytes", n, total)
+	}
+	if response, err := client.ExchangeDNS(testContext(t), []byte("after")); err != nil || string(response) != "ok:after" {
+		t.Fatalf("query after the stall: %q, %v", response, err)
+	}
+}
+
+// A client that floods requests and stops reading cannot make the server
+// start a goroutine per request.
+func TestDNSFloodIsBounded(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	block := make(chan struct{})
+	defer close(block)
+	server := dnsServerSession(serverConn, func(context.Context, []byte) ([]byte, error) {
+		<-block
+		return nil, nil
+	})
+	defer server.Close()
+
+	settings := util.StringMap{"v": "2", "padding-md5": testPadding().Load().Md5}
+	if err := writeRawFrame(clientConn, cmdSettings, 0, settings.ToBytes()); err != nil {
+		t.Fatal(err)
+	}
+	// Read the server's settings, then stop reading for good.
+	for {
+		frame, err := readRawFrame(clientConn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if frame.cmd == cmdServerSettings {
+			break
+		}
+	}
+	before := runtime.NumGoroutine()
+	for i := 1; i <= 2000; i++ {
+		if err := writeRawFrame(clientConn, cmdDNSRequest, uint32(i), []byte("q")); err != nil {
+			t.Fatalf("request %d: %v", i, err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+	if grown := runtime.NumGoroutine() - before; grown > maxDNSInFlight+16 {
+		t.Fatalf("2000 requests started %d goroutines", grown)
+	}
+	if server.IsClosed() {
+		t.Fatal("server closed under a flood")
+	}
+}
+
+// Once a server is known not to offer DNS, queries fail without dialing a new
+// session each time.
+func TestDNSUnsupportedServerDialedOnce(t *testing.T) {
+	client, servers := dnsTestClient(t, nil)
+	for i := 0; i < 5; i++ {
+		_, err := client.ExchangeDNS(testContext(t), []byte("q"))
+		if !errors.Is(err, ErrDNSUnsupported) {
+			t.Fatalf("query %d: %v, want ErrDNSUnsupported", i, err)
+		}
+	}
+	if n := len(servers()); n != 1 {
+		t.Fatalf("dialed %d sessions, want 1", n)
+	}
+}
+
+// brokenConn fails every write once broken, as a real connection whose peer
+// reset it would.
+type brokenConn struct {
+	net.Conn
+	broken atomic.Bool
+}
+
+func (c *brokenConn) Write(b []byte) (int, error) {
+	if c.broken.Load() {
+		return 0, errors.New("write: connection reset by peer")
+	}
+	return c.Conn.Write(b)
+}
+
+// A query whose write fails on a broken connection is retried on a new
+// session, whatever error the connection returned.
+func TestDNSWriteErrorRetries(t *testing.T) {
+	var lock sync.Mutex
+	var conns []*brokenConn
+	var servers []*Session
+	client := NewClient(context.Background(), logger.NOP(), func(ctx context.Context) (net.Conn, error) {
+		clientConn, serverConn := net.Pipe()
+		lock.Lock()
+		defer lock.Unlock()
+		servers = append(servers, dnsServerSession(serverConn, echoDNS))
+		conn := &brokenConn{Conn: clientConn}
+		conns = append(conns, conn)
+		return conn, nil
+	}, testPadding(), 0, 0, 0, 0, 0, 0, 0, 0, 0, false, nil, "")
+	defer func() {
+		client.Close()
+		lock.Lock()
+		defer lock.Unlock()
+		for _, server := range servers {
+			server.Close()
+		}
+	}()
+	if _, err := client.ExchangeDNS(testContext(t), []byte("warm")); err != nil {
+		t.Fatalf("warm-up query: %v", err)
+	}
+	lock.Lock()
+	conns[0].broken.Store(true)
+	lock.Unlock()
+	response, err := client.ExchangeDNS(testContext(t), []byte("again"))
+	if err != nil || string(response) != "ok:again" {
+		t.Fatalf("query on a broken session: %q, %v", response, err)
+	}
+	lock.Lock()
+	defer lock.Unlock()
+	if len(conns) != 2 {
+		t.Fatalf("dialed %d sessions, want a retry on a second one", len(conns))
+	}
+}
+
+// Pool maintenance does not close a session while a DNS query waits on it.
+func TestDNSBusySessionNotClosedAsIdle(t *testing.T) {
+	release := make(chan struct{})
+	client, _ := dnsTestClient(t, func(_ context.Context, request []byte) ([]byte, error) {
+		<-release
+		return request, nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.ExchangeDNS(testContext(t), []byte("held"))
+		done <- err
+	}()
+	waitFor(t, "the query to be pending", func() bool {
+		session := anySession(client)
+		return session != nil && session.dnsBusy()
+	})
+	session := anySession(client)
+	client.idleCleanupExpTime(time.Now().Add(time.Hour))
+	client.closeAfterIdle = time.Nanosecond
+	client.retireCleanup()
+	if session.IsClosed() {
+		t.Fatal("pool maintenance closed a session with a DNS query in flight")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("held query: %v", err)
+	}
+	client.idleCleanupExpTime(time.Now().Add(time.Hour))
+	if !session.IsClosed() {
+		t.Fatal("idle session not closed once its query finished")
+	}
+}
+
+func TestDNSHandlerCancelledOnClose(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	server := dnsServerSession(serverConn, func(ctx context.Context, _ []byte) ([]byte, error) {
+		close(started)
+		<-ctx.Done()
+		close(finished)
+		return nil, ctx.Err()
+	})
+	go func() { _, _ = io.Copy(io.Discard, clientConn) }()
+	settings := util.StringMap{"v": "2", "padding-md5": testPadding().Load().Md5}
+	_ = writeRawFrame(clientConn, cmdSettings, 0, settings.ToBytes())
+	_ = writeRawFrame(clientConn, cmdDNSRequest, 1, []byte("q"))
+	<-started
+	server.Close()
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler context not cancelled when the session closed")
+	}
+}
+
+// A query prefers a session without streams, whose receive loop a stream that
+// is not read cannot hold up.
+func TestDNSPrefersSessionWithoutStreams(t *testing.T) {
+	client, _ := dnsTestClient(t, echoDNS)
+	stream, err := client.CreateStream(context.Background())
+	if err != nil {
+		t.Fatalf("CreateStream: %v", err)
+	}
+	defer stream.Close()
+	idle, err := client.createSession(context.Background())
+	if err != nil {
+		t.Fatalf("createSession: %v", err)
+	}
+	waitFor(t, "settings", idle.serverSettingsReceived)
+	waitFor(t, "settings", func() bool {
+		for _, session := range []*Session{anySessionExcept(client, idle)} {
+			if session == nil || !session.serverSettingsReceived() {
+				return false
+			}
+		}
+		return true
+	})
+	for i := 0; i < 20; i++ {
+		session, _, err := client.dnsSession(testContext(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if session != idle {
+			t.Fatal("query placed on the session carrying a stream")
+		}
+	}
+}
+
+func anySessionExcept(c *Client, except *Session) *Session {
+	c.sessionsLock.Lock()
+	defer c.sessionsLock.Unlock()
+	for _, session := range c.sessions {
+		if session != except {
+			return session
+		}
+	}
+	return nil
 }

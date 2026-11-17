@@ -197,7 +197,7 @@ func (s *Session) Close() error {
 		}
 		s.streams = make(map[uint32]*Stream)
 		s.streamLock.Unlock()
-		s.failPendingDNS()
+		s.closeDNS()
 		return s.conn.Close()
 	} else {
 		return io.ErrClosedPipe

@@ -13,8 +13,8 @@ import (
 
 // DNSHandler answers one DNS message received from a client. request is the
 // message exactly as the client sent it, and the returned bytes are sent back
-// verbatim. ctx carries the connection's context and is cancelled when the
-// session closes. It is called on its own goroutine.
+// verbatim. ctx carries the context given to SetDNSHandler and is cancelled
+// when the session closes. It is called on its own goroutine.
 type DNSHandler func(ctx context.Context, request []byte) ([]byte, error)
 
 var (
@@ -27,9 +27,12 @@ var (
 )
 
 // maxDNSInFlight bounds the DNS requests a server session answers at once.
-// A request beyond it is answered with an empty response straight away, so
-// that a client cannot pile up goroutines on the server.
 const maxDNSInFlight = 64
+
+// maxDNSRejectQueue bounds the requests beyond maxDNSInFlight waiting to be
+// answered with a failure. Requests beyond both are dropped, so that a client
+// that floods the server, or stops reading, cannot pile up goroutines on it.
+const maxDNSRejectQueue = 256
 
 type dnsResult struct {
 	data []byte
@@ -53,20 +56,26 @@ type dnsClientState struct {
 type dnsServerState struct {
 	handler  DNSHandler
 	ctx      context.Context
+	cancel   context.CancelFunc
 	inFlight chan struct{}
+	rejects  chan uint32
 }
 
 // SetDNSHandler makes a server session offer DNS to clients and answer their
 // queries with handler. It must be called before Run.
 func (s *Session) SetDNSHandler(ctx context.Context, handler DNSHandler) {
-	if handler == nil {
+	if handler == nil || s.isClient {
 		return
 	}
+	ctx, cancel := context.WithCancel(ctx)
 	s.dnsServer = &dnsServerState{
 		handler:  handler,
 		ctx:      ctx,
+		cancel:   cancel,
 		inFlight: make(chan struct{}, maxDNSInFlight),
+		rejects:  make(chan uint32, maxDNSRejectQueue),
 	}
+	go s.rejectDNSLoop()
 }
 
 // DNSSupported reports whether the server offered DNS. It is false until the
@@ -103,9 +112,23 @@ func (s *Session) markServerSettings(dnsOffered bool) {
 	})
 }
 
-// failPendingDNS fails every request still waiting for an answer. It is
-// called when the session closes.
-func (s *Session) failPendingDNS() {
+// dnsBusy reports whether the client has DNS requests waiting for an answer
+// on the session, which keeps pool maintenance from closing it.
+func (s *Session) dnsBusy() bool {
+	if s.dnsClient == nil {
+		return false
+	}
+	s.dnsClient.pendingLock.Lock()
+	defer s.dnsClient.pendingLock.Unlock()
+	return len(s.dnsClient.pending) > 0
+}
+
+// closeDNS fails every request still waiting for an answer and cancels the
+// handlers still running. It is called when the session closes.
+func (s *Session) closeDNS() {
+	if s.dnsServer != nil {
+		s.dnsServer.cancel()
+	}
 	if s.dnsClient == nil {
 		return
 	}
@@ -119,7 +142,9 @@ func (s *Session) failPendingDNS() {
 	}
 }
 
-// exchangeDNS sends request to the server and waits for its answer.
+// exchangeDNS sends request to the server and waits for its answer. It
+// returns io.ErrClosedPipe whenever the session closes before the answer, so
+// that the caller can try another session.
 func (s *Session) exchangeDNS(ctx context.Context, request []byte) ([]byte, error) {
 	if s.dnsClient == nil {
 		return nil, ErrDNSUnsupported
@@ -137,10 +162,10 @@ func (s *Session) exchangeDNS(ctx context.Context, request []byte) ([]byte, erro
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+	if s.IsClosed() {
+		return nil, io.ErrClosedPipe
+	}
 	if !s.dnsClient.supported.Load() {
-		if s.IsClosed() {
-			return nil, io.ErrClosedPipe
-		}
 		return nil, ErrDNSUnsupported
 	}
 
@@ -168,41 +193,80 @@ func (s *Session) exchangeDNS(ctx context.Context, request []byte) ([]byte, erro
 		s.dnsClient.pendingLock.Unlock()
 	}
 
-	f := newFrame(cmdDNSRequest, id)
-	f.data = request
-	if _, err := s.writeControlFrame(f); err != nil {
-		unregister()
-		return nil, err
-	}
-
-	select {
-	case result := <-ch:
-		return result.data, result.err
-	case <-ctx.Done():
-		unregister()
-		return nil, ctx.Err()
-	case <-s.die:
-		// Close fails pending requests; prefer an answer that raced it.
+	// The request waits its turn behind data frames rather than putting a
+	// deadline on the whole connection as writeControlFrame does, which would
+	// also fail a stream write blocked by ordinary backpressure. It is written
+	// on its own goroutine so that the caller's deadline still applies.
+	written := make(chan error, 1)
+	go func() {
+		written <- s.writeAsyncFrame(cmdDNSRequest, id, request)
+	}()
+	for {
 		select {
+		case err := <-written:
+			if err != nil {
+				// The connection is broken; nothing else can use it.
+				s.Close()
+				unregister()
+				return nil, io.ErrClosedPipe
+			}
+			written = nil
 		case result := <-ch:
 			return result.data, result.err
-		default:
+		case <-ctx.Done():
+			unregister()
+			return nil, ctx.Err()
+		case <-s.die:
+			// Close fails pending requests; prefer an answer that raced it.
+			select {
+			case result := <-ch:
+				if result.err == nil {
+					return result.data, nil
+				}
+			default:
+			}
+			unregister()
+			return nil, io.ErrClosedPipe
 		}
-		unregister()
-		return nil, io.ErrClosedPipe
 	}
 }
 
 // handleDNSRequest takes a request read by recvLoop. It never blocks.
 func (s *Session) handleDNSRequest(id uint32, request []byte) {
-	if s.isClient || s.dnsServer == nil || len(request) == 0 {
+	if s.isClient || s.dnsServer == nil {
+		return
+	}
+	if len(request) == 0 {
+		s.rejectDNS(id)
 		return
 	}
 	select {
 	case s.dnsServer.inFlight <- struct{}{}:
 		go s.serveDNS(id, request)
 	default:
-		go s.writeDNSResponse(id, nil)
+		s.rejectDNS(id)
+	}
+}
+
+// rejectDNS queues a failure answer for a request the server will not handle,
+// or drops the request when the queue is full.
+func (s *Session) rejectDNS(id uint32) {
+	select {
+	case s.dnsServer.rejects <- id:
+	default:
+	}
+}
+
+// rejectDNSLoop answers rejected requests one at a time until the session
+// closes, so that rejecting costs no goroutine per request.
+func (s *Session) rejectDNSLoop() {
+	for {
+		select {
+		case <-s.die:
+			return
+		case id := <-s.dnsServer.rejects:
+			s.writeDNSResponse(id, nil)
+		}
 	}
 }
 
@@ -245,10 +309,10 @@ func (s *Session) handleDNSResponse(id uint32, response []byte) {
 }
 
 // ExchangeDNS sends a DNS message to the server over a session and returns
-// the server's answer. It uses the open session with the lowest latency that
-// offered DNS, waits for a session whose settings have not arrived yet, and
-// dials one when there is none. A session that closes mid-query is retried
-// once on another.
+// the server's answer. It prefers an open session without streams, whose
+// receive loop no stream can hold up, then the lowest latency; it waits for a
+// session whose settings have not arrived yet, and dials one when there is
+// none. A session that closes mid-query is retried once on another.
 func (c *Client) ExchangeDNS(ctx context.Context, request []byte) ([]byte, error) {
 	if len(request) > maxFrameDataLen {
 		return nil, ErrDNSMessageTooLarge
@@ -277,10 +341,15 @@ func (c *Client) ExchangeDNS(ctx context.Context, request []byte) ([]byte, error
 }
 
 // dnsSession picks the session a DNS query goes on. It does not take the
-// session out of the idle pool, so it never disturbs where streams go.
+// session out of the idle pool, so it never disturbs where streams go, but it
+// marks the session used so that the idle timeout does not close it.
 func (c *Client) dnsSession(ctx context.Context) (*Session, bool, error) {
 	now := time.Now()
-	var best, pendingSettings *Session
+	var (
+		best, pendingSettings *Session
+		bestStreams           int
+		unsupported           bool
+	)
 	c.sessionsLock.Lock()
 	for _, session := range c.sessions {
 		if session.IsClosed() || session.retired(now) {
@@ -293,17 +362,27 @@ func (c *Client) dnsSession(ctx context.Context) (*Session, bool, error) {
 			continue
 		}
 		if !session.DNSSupported() {
+			unsupported = true
 			continue
 		}
-		if best == nil || preferred(session, best) {
-			best = session
+		streams := session.streamCount()
+		if best == nil || (streams == 0) != (bestStreams == 0) && streams == 0 ||
+			(streams == 0) == (bestStreams == 0) && preferred(session, best) {
+			best, bestStreams = session, streams
 		}
 	}
 	c.sessionsLock.Unlock()
 	if best != nil {
+		c.markDNSUse(best)
 		return best, false, nil
 	}
+	if unsupported {
+		// Every session goes to the same server, so a new one would not
+		// offer DNS either.
+		return nil, false, ErrDNSUnsupported
+	}
 	if pendingSettings != nil {
+		c.markDNSUse(pendingSettings)
 		return pendingSettings, false, nil
 	}
 	session, err := c.createSession(ctx)
@@ -315,12 +394,29 @@ func (c *Client) dnsSession(ctx context.Context) (*Session, bool, error) {
 	}
 	if !c.disableReuse {
 		// Pool it like a session made for ensure_idle_session, so that the
-		// idle timeout closes it when nothing uses it.
+		// idle timeout closes it when nothing uses it. A session that already
+		// closed has run its dieHook and must not enter the pool.
 		c.idleSessionLock.Lock()
-		session.idleSince = time.Now()
-		c.idleSession.Insert(math.MaxUint64-session.seq, session)
+		if !session.IsClosed() {
+			session.idleSince = time.Now()
+			c.idleSession.Insert(math.MaxUint64-session.seq, session)
+		}
 		c.idleSessionLock.Unlock()
 		c.updatePoolMetrics()
 	}
 	return session, true, nil
+}
+
+// markDNSUse restarts the idle time of a session a DNS query uses. The pool
+// only reads idleSince under idleSessionLock.
+func (c *Client) markDNSUse(session *Session) {
+	c.idleSessionLock.Lock()
+	session.idleSince = time.Now()
+	c.idleSessionLock.Unlock()
+}
+
+func (s *Session) streamCount() int {
+	s.streamLock.RLock()
+	defer s.streamLock.RUnlock()
+	return len(s.streams)
 }
