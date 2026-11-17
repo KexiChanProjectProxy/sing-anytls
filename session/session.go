@@ -198,6 +198,14 @@ func (s *Session) Close() error {
 		s.streams = make(map[uint32]*Stream)
 		s.streamLock.Unlock()
 		s.closeDNS()
+		// Stop the SYNACK watchdog, whose goroutine would otherwise outlive
+		// the session by up to its timeout.
+		s.synDoneLock.Lock()
+		if s.synDone != nil {
+			s.synDone()
+			s.synDone = nil
+		}
+		s.synDoneLock.Unlock()
 		return s.conn.Close()
 	} else {
 		return io.ErrClosedPipe

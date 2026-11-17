@@ -11,6 +11,8 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+
+	"go.uber.org/goleak"
 )
 
 type discardHandler struct{}
@@ -21,6 +23,8 @@ func (discardHandler) NewConnectionEx(_ context.Context, conn net.Conn, _ M.Sock
 
 // The DNS handler sees the user the connection authenticated as.
 func TestServiceDNSHandlerSeesUser(t *testing.T) {
+	ignore := goleak.IgnoreCurrent()
+	defer goleak.VerifyNone(t, ignore)
 	users := make(chan string, 1)
 	service, err := NewService(ServiceConfig{
 		Users:         []User{{Name: "alice", Password: "secret"}},

@@ -15,7 +15,20 @@ import (
 
 	"github.com/anytls/sing-anytls/util"
 	"github.com/sagernet/sing/common/logger"
+
+	"go.uber.org/goleak"
 )
+
+// checkLeaks fails the test if it leaves goroutines behind once it and its
+// cleanups have finished. It must be the test's first call, so that its
+// cleanup runs last.
+func checkLeaks(t *testing.T) {
+	t.Helper()
+	ignore := goleak.IgnoreCurrent()
+	t.Cleanup(func() {
+		goleak.VerifyNone(t, ignore)
+	})
+}
 
 // dnsServerSession starts a server session that echoes streams and answers DNS
 // with handler, nil for a server that does not offer DNS.
@@ -68,6 +81,7 @@ func testContext(t *testing.T) context.Context {
 }
 
 func TestDNSRoundTrip(t *testing.T) {
+	checkLeaks(t)
 	client, _ := dnsTestClient(t, echoDNS)
 	response, err := client.ExchangeDNS(testContext(t), []byte("query"))
 	if err != nil {
@@ -80,6 +94,7 @@ func TestDNSRoundTrip(t *testing.T) {
 
 // Concurrent queries on one session must each get their own answer back.
 func TestDNSConcurrentQueriesMatchAnswers(t *testing.T) {
+	checkLeaks(t)
 	client, servers := dnsTestClient(t, func(_ context.Context, request []byte) ([]byte, error) {
 		// Answer out of order.
 		time.Sleep(time.Duration(request[0]%7) * time.Millisecond)
@@ -140,6 +155,7 @@ func serverSettingsOf(t *testing.T, handler DNSHandler) util.StringMap {
 }
 
 func TestServerOffersDNSOnlyWithHandler(t *testing.T) {
+	checkLeaks(t)
 	if settings := serverSettingsOf(t, echoDNS); settings["dns"] != "1" {
 		t.Fatalf("server with a handler sent %v", settings)
 	}
@@ -152,6 +168,7 @@ func TestServerOffersDNSOnlyWithHandler(t *testing.T) {
 // A client must not send a DNS frame to a server that did not offer DNS,
 // since an upstream server would misparse its payload.
 func TestDNSNotSentToServerWithoutOffer(t *testing.T) {
+	checkLeaks(t)
 	clientConn, serverConn := net.Pipe()
 	defer serverConn.Close()
 	client := newTestClient(clientConn, testPadding())
@@ -186,6 +203,7 @@ func TestDNSNotSentToServerWithoutOffer(t *testing.T) {
 }
 
 func TestDNSHandlerFailure(t *testing.T) {
+	checkLeaks(t)
 	for name, handler := range map[string]DNSHandler{
 		"error": func(context.Context, []byte) ([]byte, error) {
 			return nil, errors.New("boom")
@@ -212,6 +230,7 @@ func TestDNSHandlerFailure(t *testing.T) {
 }
 
 func TestDNSMaximumSizes(t *testing.T) {
+	checkLeaks(t)
 	client, _ := dnsTestClient(t, func(_ context.Context, request []byte) ([]byte, error) {
 		return bytes.Repeat([]byte{'a'}, maxFrameDataLen), nil
 	})
@@ -225,6 +244,7 @@ func TestDNSMaximumSizes(t *testing.T) {
 }
 
 func TestDNSRequestTooLargeIsNotSent(t *testing.T) {
+	checkLeaks(t)
 	var calls atomic.Int32
 	client, servers := dnsTestClient(t, func(context.Context, []byte) ([]byte, error) {
 		calls.Add(1)
@@ -240,6 +260,7 @@ func TestDNSRequestTooLargeIsNotSent(t *testing.T) {
 }
 
 func TestDNSCancelledQueryIsForgotten(t *testing.T) {
+	checkLeaks(t)
 	release := make(chan struct{})
 	client, _ := dnsTestClient(t, func(_ context.Context, request []byte) ([]byte, error) {
 		if string(request) == "slow" {
@@ -273,6 +294,7 @@ func TestDNSCancelledQueryIsForgotten(t *testing.T) {
 // A session that closes mid-query fails the query at once, and the client
 // tries again on a new session.
 func TestDNSSessionClosedMidQueryRetries(t *testing.T) {
+	checkLeaks(t)
 	var first atomic.Bool
 	first.Store(true)
 	block := make(chan struct{})
@@ -308,6 +330,7 @@ func TestDNSSessionClosedMidQueryRetries(t *testing.T) {
 }
 
 func TestDNSPendingFailedOnClose(t *testing.T) {
+	checkLeaks(t)
 	block := make(chan struct{})
 	defer close(block)
 	client, _ := dnsTestClient(t, func(context.Context, []byte) ([]byte, error) {
@@ -344,6 +367,7 @@ func (c *Client) dnsSessionForTest(t *testing.T) (*Session, error) {
 // A server answers past maxDNSInFlight at once rather than queueing, so that
 // a client cannot pile up handlers.
 func TestDNSInFlightLimit(t *testing.T) {
+	checkLeaks(t)
 	release := make(chan struct{})
 	var running atomic.Int32
 	client, _ := dnsTestClient(t, func(_ context.Context, request []byte) ([]byte, error) {
@@ -377,6 +401,7 @@ func TestDNSInFlightLimit(t *testing.T) {
 
 // Stray DNS frames in the wrong direction are skipped with their payload.
 func TestDNSFramesInWrongDirectionIgnored(t *testing.T) {
+	checkLeaks(t)
 	clientConn, serverConn := net.Pipe()
 	defer serverConn.Close()
 	client := newTestClient(clientConn, testPadding())
@@ -411,6 +436,7 @@ func TestDNSFramesInWrongDirectionIgnored(t *testing.T) {
 }
 
 func TestDNSResponseIgnoredByServer(t *testing.T) {
+	checkLeaks(t)
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	server := dnsServerSession(serverConn, echoDNS)
@@ -429,6 +455,7 @@ func TestDNSResponseIgnoredByServer(t *testing.T) {
 
 // Streams and DNS share a session without disturbing each other.
 func TestDNSDoesNotTakeSessionFromPool(t *testing.T) {
+	checkLeaks(t)
 	client, servers := dnsTestClient(t, echoDNS)
 	roundTrip(t, client)
 	if _, err := client.ExchangeDNS(testContext(t), []byte("q")); err != nil {
@@ -444,6 +471,7 @@ func TestDNSDoesNotTakeSessionFromPool(t *testing.T) {
 // its own deadline and must not put a deadline on the connection that fails
 // the stalled stream.
 func TestDNSRequestDoesNotBreakBackpressure(t *testing.T) {
+	checkLeaks(t)
 	clientConn, serverConn := net.Pipe()
 	pad := testPadding()
 	release := make(chan struct{})
@@ -503,6 +531,7 @@ func TestDNSRequestDoesNotBreakBackpressure(t *testing.T) {
 // A client that floods requests and stops reading cannot make the server
 // start a goroutine per request.
 func TestDNSFloodIsBounded(t *testing.T) {
+	checkLeaks(t)
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	block := make(chan struct{})
@@ -545,6 +574,7 @@ func TestDNSFloodIsBounded(t *testing.T) {
 // Once a server is known not to offer DNS, queries fail without dialing a new
 // session each time.
 func TestDNSUnsupportedServerDialedOnce(t *testing.T) {
+	checkLeaks(t)
 	client, servers := dnsTestClient(t, nil)
 	for i := 0; i < 5; i++ {
 		_, err := client.ExchangeDNS(testContext(t), []byte("q"))
@@ -574,6 +604,7 @@ func (c *brokenConn) Write(b []byte) (int, error) {
 // A query whose write fails on a broken connection is retried on a new
 // session, whatever error the connection returned.
 func TestDNSWriteErrorRetries(t *testing.T) {
+	checkLeaks(t)
 	var lock sync.Mutex
 	var conns []*brokenConn
 	var servers []*Session
@@ -613,6 +644,7 @@ func TestDNSWriteErrorRetries(t *testing.T) {
 
 // Pool maintenance does not close a session while a DNS query waits on it.
 func TestDNSBusySessionNotClosedAsIdle(t *testing.T) {
+	checkLeaks(t)
 	release := make(chan struct{})
 	client, _ := dnsTestClient(t, func(_ context.Context, request []byte) ([]byte, error) {
 		<-release
@@ -645,6 +677,7 @@ func TestDNSBusySessionNotClosedAsIdle(t *testing.T) {
 }
 
 func TestDNSHandlerCancelledOnClose(t *testing.T) {
+	checkLeaks(t)
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	started := make(chan struct{})
@@ -671,6 +704,7 @@ func TestDNSHandlerCancelledOnClose(t *testing.T) {
 // A query prefers a session without streams, whose receive loop a stream that
 // is not read cannot hold up.
 func TestDNSPrefersSessionWithoutStreams(t *testing.T) {
+	checkLeaks(t)
 	client, _ := dnsTestClient(t, echoDNS)
 	stream, err := client.CreateStream(context.Background())
 	if err != nil {
