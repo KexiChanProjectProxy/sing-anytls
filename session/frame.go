@@ -28,6 +28,15 @@ const ( // cmds
 	// a peer that does not know them never sees them.
 	cmdDNSRequest  = 12
 	cmdDNSResponse = 13
+	// cmdProbeRequest starts or stops a throughput probe, cmdProbeData carries
+	// its filler in either direction, and cmdProbeStatus is the server's
+	// answer, all matched by the probe id in the stream id field. They are a
+	// fork extension: a client only sends a request to a server that offered
+	// "probe=1" in its settings, so a peer that does not know them never sees
+	// them.
+	cmdProbeRequest = 14
+	cmdProbeData    = 15
+	cmdProbeStatus  = 16
 )
 
 const (

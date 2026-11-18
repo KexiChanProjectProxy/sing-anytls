@@ -72,6 +72,10 @@ type Session struct {
 
 	// dnsClient is the client half of in-session DNS, nil on a server.
 	dnsClient *dnsClientState
+	// probeClient is the client half of probing, and probing is set while a
+	// probe runs, when latency samples are not taken.
+	probeClient probeClientState
+	probing     atomic.Bool
 
 	// server
 	onNewStream func(stream *Stream)
@@ -81,6 +85,9 @@ type Session struct {
 	// dnsServer answers clients' DNS queries, and is nil when the server does
 	// not offer DNS.
 	dnsServer *dnsServerState
+	// probeServer runs clients' probes, and is nil when the server does not
+	// offer them.
+	probeServer *probeServerState
 }
 
 // StatsHandler receives a statistics frame for the client session numbered
@@ -395,6 +402,9 @@ func (s *Session) recvLoop() error {
 								// Clients that do not know this key ignore it.
 								serverSettings["dns"] = "1"
 							}
+							if s.probeServer != nil {
+								serverSettings["probe"] = "1"
+							}
 							f.data = serverSettings.ToBytes()
 							_, err = s.writeControlFrame(f)
 							if err != nil {
@@ -466,6 +476,7 @@ func (s *Session) recvLoop() error {
 						if v, err := strconv.Atoi(m["v"]); err == nil {
 							s.peerVersion.Store(uint32(byte(v)))
 						}
+						s.probeClient.offered.Store(m["probe"] == "1")
 						s.markServerSettings(m["dns"] == "1")
 					}
 					buf.Put(buffer)
@@ -496,6 +507,26 @@ func (s *Session) recvLoop() error {
 					s.handleDNSRequest(sid, payload)
 				} else {
 					s.handleDNSResponse(sid, payload)
+				}
+			case cmdProbeRequest, cmdProbeStatus:
+				var payload []byte
+				if hdr.Length() > 0 {
+					payload = make([]byte, int(hdr.Length()))
+					if _, err := io.ReadFull(s.conn, payload); err != nil {
+						return err
+					}
+				}
+				if hdr.Cmd() == cmdProbeRequest {
+					s.handleProbeRequest(sid, payload)
+				} else {
+					s.handleProbeStatus(sid, payload)
+				}
+			case cmdProbeData:
+				if hdr.Length() > 0 {
+					if _, err := io.CopyN(io.Discard, s.conn, int64(hdr.Length())); err != nil {
+						return err
+					}
+					s.handleProbeData(sid, int(hdr.Length()))
 				}
 			default:
 				// An unknown command is skipped along with its payload, so that
@@ -599,6 +630,9 @@ func (s *Session) Latency() Latency {
 // not race with each other; a reader may see the count and the average one
 // update apart, which is harmless.
 func (s *Session) recordLatency(sample time.Duration, source string) {
+	if s.probing.Load() {
+		return
+	}
 	if sample < 0 {
 		sample = 0
 	}
