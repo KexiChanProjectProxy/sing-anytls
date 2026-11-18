@@ -211,26 +211,9 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 		c.updatePoolMetrics()
 	}
 
-	stream, err = session.OpenStream()
-	if err != nil {
-		session.Close()
-		if c.metricsCallback != nil {
-			c.metricsCallback.StreamError()
-		}
-		return nil, fmt.Errorf("failed to create stream: %w", err)
-	}
-
-	streams := session.streamsOpened.Add(1)
-
-	// Report stream opened
-	if c.metricsCallback != nil {
-		c.metricsCallback.StreamOpened()
-	}
-	if handler := c.selectHandler.Load(); handler != nil {
-		handler(ctx, c.sessionInfo(session, !sessionCreated, idleFor, streams))
-	}
-
-	stream.dieHook = func() {
+	// The hook is attached before the SYN goes out: a server that refuses the
+	// stream at once closes it from recvLoop before openStream returns.
+	dieHook := func() {
 		// Report stream closed
 		if c.metricsCallback != nil {
 			c.metricsCallback.StreamClosed()
@@ -245,6 +228,14 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 			if session.retired(time.Now()) {
 				// Its stream was the only thing keeping a retired session open.
 				c.closeRetired(session, retireReasonLifetime, "its stream ended")
+				return
+			}
+			if failures := session.handshakeFailures.Load(); failures >= maxHandshakeFailures {
+				// A server that refuses every stream on a session while the
+				// session itself stays up, as a server instance closed under
+				// a live connection does, would otherwise keep it in the pool
+				// for good: each refusal returns it there as freshly idle.
+				c.closeRetired(session, retireReasonHandshakeFailures, fmt.Sprintf("%d streams refused in a row", failures))
 				return
 			}
 
@@ -262,6 +253,25 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 				c.updatePoolMetrics()
 			}
 		}
+	}
+
+	stream, err = session.openStream(dieHook)
+	if err != nil {
+		session.Close()
+		if c.metricsCallback != nil {
+			c.metricsCallback.StreamError()
+		}
+		return nil, fmt.Errorf("failed to create stream: %w", err)
+	}
+
+	streams := session.streamsOpened.Add(1)
+
+	// Report stream opened
+	if c.metricsCallback != nil {
+		c.metricsCallback.StreamOpened()
+	}
+	if handler := c.selectHandler.Load(); handler != nil {
+		handler(ctx, c.sessionInfo(session, !sessionCreated, idleFor, streams))
 	}
 
 	return stream, nil
@@ -762,7 +772,16 @@ func compareRetirement(a Latency, aCreated time.Time, b Latency, bCreated time.T
 const (
 	retireReasonIdle     = "close_after_idle"
 	retireReasonLifetime = "close_after_lifetime"
+	// retireReasonHandshakeFailures closes a session after
+	// maxHandshakeFailures streams in a row were refused by the server.
+	retireReasonHandshakeFailures = "handshake_failures"
 )
+
+// maxHandshakeFailures is how many streams in a row the server may refuse on
+// a session before the client stops reusing it. One refusal is normal, an
+// unreachable destination; a few in a row with no stream accepted between
+// them mean the session is likely no use, and a new one costs one handshake.
+const maxHandshakeFailures = 3
 
 // retirementLifetime draws a session's lifetime under close_after_lifetime
 // uniformly from [0.9, 1] of it, so that sessions created together, such as an

@@ -63,6 +63,9 @@ type Session struct {
 	latencySamples  atomic.Uint32
 	// streamsOpened counts the streams opened on the session.
 	streamsOpened atomic.Uint64
+	// handshakeFailures counts the streams in a row the server refused with
+	// an error SYNACK; a SYNACK without an error resets it.
+	handshakeFailures atomic.Uint32
 	// statsHandler receives the server's statistics frames. The client only
 	// asks the server for them when it is set.
 	statsHandler StatsHandler
@@ -214,12 +217,19 @@ func (s *Session) Close() error {
 
 // OpenStream is used to create a new stream for CLIENT
 func (s *Session) OpenStream() (*Stream, error) {
+	return s.openStream(nil)
+}
+
+// openStream opens a stream with dieHook already attached, so that it runs
+// even when the stream closes before openStream returns.
+func (s *Session) openStream(dieHook func()) (*Stream, error) {
 	if s.IsClosed() {
 		return nil, io.ErrClosedPipe
 	}
 
 	sid := s.streamId.Add(1)
 	stream := newStream(sid, s)
+	stream.dieHook = dieHook
 
 	if sid >= 2 && s.peerVersion.Load() >= 2 {
 		s.synDoneLock.Lock()
@@ -316,7 +326,12 @@ func (s *Session) recvLoop() error {
 					s.synDone = nil
 				}
 				s.synDoneLock.Unlock()
-				if hdr.Length() > 0 {
+				if hdr.Length() == 0 {
+					s.handshakeFailures.Store(0)
+				} else {
+					// Counted before the stream closes, so that its dieHook
+					// sees this failure.
+					s.handshakeFailures.Add(1)
 					buffer := buf.Get(int(hdr.Length()))
 					if _, err := io.ReadFull(s.conn, buffer); err != nil {
 						buf.Put(buffer)
