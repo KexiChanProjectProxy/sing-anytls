@@ -208,6 +208,8 @@ func (s *Session) Close() error {
 		s.streams = make(map[uint32]*Stream)
 		s.streamLock.Unlock()
 		s.closeDNS()
+		// Filler that arrived outside an upload still counts as traffic.
+		s.accountStray()
 		// Stop the SYNACK watchdog, whose goroutine would otherwise outlive
 		// the session by up to its timeout.
 		s.synDoneLock.Lock()
@@ -590,6 +592,9 @@ func (s *Session) heartbeatLoop() {
 // request is still unanswered its timestamp is kept, because the next response
 // belongs to it: the server answers requests in the order they arrive.
 func (s *Session) sendHeartbeat() error {
+	if s.probing.Load() {
+		return nil
+	}
 	s.heartbeatSentAt.CompareAndSwap(0, monoNow())
 	_, err := s.writeControlFrame(newFrame(cmdHeartRequest, 0))
 	return err

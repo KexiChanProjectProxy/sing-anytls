@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/anytls/sing-anytls/util"
+	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/logger"
 )
 
@@ -138,9 +139,8 @@ func TestProbeUpload(t *testing.T) {
 	if result.Bytes != 300_000 || result.Server["bytes"] != "300000" || result.Server["dir"] != "up" {
 		t.Fatalf("sent %d, server result %v", result.Bytes, result.Server)
 	}
-	// The server ends the upload itself when the limit is reached, or on the
-	// client's stop; either is correct.
-	if result.Reason != ProbeReasonBytes && result.Reason != ProbeReasonStop {
+	// The client stops the upload once it has sent what was allowed.
+	if result.Reason != ProbeReasonStop {
 		t.Fatalf("reason = %q", result.Reason)
 	}
 	if serverRun.polls.Load() != 0 {
@@ -342,5 +342,207 @@ func TestProbeOfferedInSettings(t *testing.T) {
 		}
 		client.Close()
 		server.Close()
+	}
+}
+
+type accountEntry struct {
+	user      string
+	direction ProbeDirection
+	bytes     int64
+}
+
+// accountRecorder records what a server accounts.
+type accountRecorder struct {
+	access  sync.Mutex
+	entries []accountEntry
+}
+
+func (r *accountRecorder) account(ctx context.Context, direction ProbeDirection, bytes int64) {
+	user, _ := auth.UserFromContext[string](ctx)
+	r.access.Lock()
+	r.entries = append(r.entries, accountEntry{user, direction, bytes})
+	r.access.Unlock()
+}
+
+func (r *accountRecorder) total(direction ProbeDirection) int64 {
+	r.access.Lock()
+	defer r.access.Unlock()
+	var total int64
+	for _, entry := range r.entries {
+		if entry.direction == direction {
+			total += entry.bytes
+		}
+	}
+	return total
+}
+
+func TestProbeAccountsFiller(t *testing.T) {
+	checkLeaks(t)
+	recorder := &accountRecorder{}
+	client := probeTestClient(t, &ProbeConfig{MaxBytes: 200_000, Account: recorder.account})
+	down, err := client.Probe(testContext(t), ProbeRequest{Direction: ProbeDownload})
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	up, err := client.Probe(testContext(t), ProbeRequest{Direction: ProbeUpload})
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if got := recorder.total(ProbeDownload); got != down.Bytes || got != 200_000 {
+		t.Fatalf("accounted %d of a %d byte download", got, down.Bytes)
+	}
+	if got := recorder.total(ProbeUpload); got != up.Bytes || got != 200_000 {
+		t.Fatalf("accounted %d of a %d byte upload", got, up.Bytes)
+	}
+}
+
+// rawProbeServer starts a server session offering probes under config, for a
+// test that speaks the protocol itself on the returned connection, and
+// returns a channel of the frames the server sends.
+func rawProbeServer(t *testing.T, ctx context.Context, server *ProbeServer, read bool) (net.Conn, *Session, chan rawFrame) {
+	t.Helper()
+	clientConn, serverConn := net.Pipe()
+	session := NewServerSession(serverConn, nil, testPadding(), logger.NOP())
+	session.SetProbeServer(ctx, server)
+	go session.Run()
+	t.Cleanup(func() {
+		clientConn.Close()
+		session.Close()
+	})
+	frames := make(chan rawFrame, 64)
+	settings := util.StringMap{"v": "2", "padding-md5": testPadding().Load().Md5}
+	if err := writeRawFrame(clientConn, cmdSettings, 0, settings.ToBytes()); err != nil {
+		t.Fatalf("settings: %v", err)
+	}
+	if read {
+		go func() {
+			defer close(frames)
+			for {
+				frame, err := readRawFrame(clientConn)
+				if err != nil {
+					return
+				}
+				if frame.cmd == cmdProbeStatus {
+					frames <- frame
+				}
+			}
+		}()
+	} else {
+		// Take only the server's settings, then stop reading.
+		if frame, err := readRawFrame(clientConn); err != nil || frame.cmd != cmdServerSettings {
+			t.Fatalf("server settings: %v %v", frame, err)
+		}
+	}
+	return clientConn, session, frames
+}
+
+func waitClosed(t *testing.T, session *Session, within time.Duration) {
+	t.Helper()
+	select {
+	case <-session.die:
+	case <-time.After(within):
+		t.Fatal("session still open")
+	}
+}
+
+// A client that starts a download and stops reading has its session closed
+// once the probe overruns, which frees the probe's slot.
+func TestProbeWatchdogFreesStalledDownload(t *testing.T) {
+	checkLeaks(t)
+	defer func(grace time.Duration) { probeWatchdogGrace = grace }(probeWatchdogGrace)
+	probeWatchdogGrace = 100 * time.Millisecond
+	server := NewProbeServer(ProbeConfig{MaxConcurrent: 1, MaxDuration: 100 * time.Millisecond})
+	conn, session, _ := rawProbeServer(t, context.Background(), server, false)
+	start := util.StringMap{"action": "start", "dir": "down"}
+	if err := writeRawFrame(conn, cmdProbeRequest, 1, start.ToBytes()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitClosed(t, session, 3*time.Second)
+	waitFor(t, "the probe slot to be released", func() bool { return len(server.running) == 0 })
+}
+
+// Filler sent outside an upload is accounted, and a session that sends more
+// of it than one upload allows is closed.
+func TestProbeStrayFillerIsAccountedAndBounded(t *testing.T) {
+	checkLeaks(t)
+	recorder := &accountRecorder{}
+	server := NewProbeServer(ProbeConfig{MaxBytes: 3 * probeChunk, Account: recorder.account})
+	ctx := auth.ContextWithUser(context.Background(), "mallory")
+	conn, session, _ := rawProbeServer(t, ctx, server, true)
+	for i := 0; i < 4; i++ {
+		if err := writeRawFrame(conn, cmdProbeData, 9, probeFiller); err != nil {
+			break
+		}
+	}
+	waitClosed(t, session, 3*time.Second)
+	if got := recorder.total(ProbeUpload); got != 4*probeChunk {
+		t.Fatalf("accounted %d stray bytes, want %d", got, 4*probeChunk)
+	}
+	if recorder.entries[0].user != "mallory" {
+		t.Fatalf("accounted to %q", recorder.entries[0].user)
+	}
+}
+
+// An upload beyond its grant closes the session, and what arrived is
+// accounted.
+func TestProbeUploadOverLimitClosesSession(t *testing.T) {
+	checkLeaks(t)
+	recorder := &accountRecorder{}
+	server := NewProbeServer(ProbeConfig{Account: recorder.account})
+	conn, session, frames := rawProbeServer(t, context.Background(), server, true)
+	start := util.StringMap{"action": "start", "dir": "up", "bytes": "1"}
+	if err := writeRawFrame(conn, cmdProbeRequest, 1, start.ToBytes()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if status := util.StringMapFromBytes((<-frames).data); status["status"] != "accepted" || status["bytes"] != "1" {
+		t.Fatalf("status = %v", status)
+	}
+	_ = writeRawFrame(conn, cmdProbeData, 1, probeFiller)
+	waitClosed(t, session, 3*time.Second)
+	waitFor(t, "the upload to be accounted", func() bool { return recorder.total(ProbeUpload) == probeChunk })
+}
+
+// The cooldown follows the user across sessions.
+func TestProbeCooldownFollowsUser(t *testing.T) {
+	checkLeaks(t)
+	server := NewProbeServer(ProbeConfig{MaxBytes: probeChunk})
+	alice := auth.ContextWithUser(context.Background(), "alice")
+	probeOn := func(ctx context.Context) util.StringMap {
+		conn, _, frames := rawProbeServer(t, ctx, server, true)
+		start := util.StringMap{"action": "start", "dir": "down"}
+		if err := writeRawFrame(conn, cmdProbeRequest, 1, start.ToBytes()); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		status := util.StringMapFromBytes((<-frames).data)
+		if status["status"] == "accepted" {
+			<-frames
+		}
+		return status
+	}
+	if status := probeOn(alice); status["status"] != "accepted" {
+		t.Fatalf("first probe: %v", status)
+	}
+	if status := probeOn(alice); status["status"] != "refused" || status["reason"] != ProbeReasonCooldown {
+		t.Fatalf("alice on a new session: %v", status)
+	}
+	if status := probeOn(auth.ContextWithUser(context.Background(), "bob")); status["status"] != "accepted" {
+		t.Fatalf("bob: %v", status)
+	}
+}
+
+// A server that never sends its settings, as version 1 servers do not, does
+// not offer probes.
+func TestProbeWithoutServerSettings(t *testing.T) {
+	checkLeaks(t)
+	defer func(timeout time.Duration) { probeSettingsTimeout = timeout }(probeSettingsTimeout)
+	probeSettingsTimeout = 100 * time.Millisecond
+	clientConn, serverConn := net.Pipe()
+	defer serverConn.Close()
+	go func() { _, _ = io.Copy(io.Discard, serverConn) }()
+	client := NewClientSession(clientConn, testPadding(), logger.NOP(), 0, "")
+	client.Run()
+	defer client.Close()
+	if _, err := client.probe(testContext(t), ProbeRequest{}); !errors.Is(err, ErrProbeUnsupported) {
+		t.Fatalf("probe = %v", err)
 	}
 }
