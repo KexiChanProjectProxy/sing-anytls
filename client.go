@@ -112,6 +112,39 @@ var (
 	ErrDNSMessageTooLarge = session.ErrDNSMessageTooLarge
 )
 
+// Probe fills one session with filler to measure the path's capacity in one
+// direction. It returns ErrProbeUnsupported when the server does not offer
+// probes, and a *ProbeRefusedError when it refuses this one.
+func (c *Client) Probe(ctx context.Context, request ProbeRequest) (ProbeResult, error) {
+	return c.sessionClient.Probe(ctx, request)
+}
+
+// IdleSessions describes the idle sessions, which a probe can name by Seq.
+func (c *Client) IdleSessions() []session.SessionInfo {
+	return c.sessionClient.IdleSessions()
+}
+
+// Probe types and errors.
+type (
+	ProbeRequest      = session.ProbeRequest
+	ProbeResult       = session.ProbeResult
+	ProbeDirection    = session.ProbeDirection
+	ProbeMeter        = session.ProbeMeter
+	ProbeRun          = session.ProbeRun
+	ProbeRefusedError = session.ProbeRefusedError
+)
+
+const (
+	ProbeDownload = session.ProbeDownload
+	ProbeUpload   = session.ProbeUpload
+)
+
+var (
+	ErrProbeUnsupported        = session.ErrProbeUnsupported
+	ErrProbeSessionUnavailable = session.ErrProbeSessionUnavailable
+	ErrProbeTimeout            = session.ErrProbeTimeout
+)
+
 func (c *Client) CreateProxy(ctx context.Context, destination M.Socksaddr) (net.Conn, error) {
 	conn, err := c.sessionClient.CreateStream(ctx)
 	if err != nil {

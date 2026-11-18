@@ -28,6 +28,7 @@ type Service struct {
 	logger          logger.ContextLogger
 	statsProvider   session.StatsProvider
 	dnsHandler      session.DNSHandler
+	probeServer     *session.ProbeServer
 }
 
 type ServiceConfig struct {
@@ -42,7 +43,14 @@ type ServiceConfig struct {
 	// DNSHandler, when set, makes the server offer DNS to clients and answer
 	// their in-session queries. Its context carries the authenticated user.
 	DNSHandler session.DNSHandler
+	// Probe, when set, makes the server offer throughput probes to clients
+	// within these limits. Its meter's context carries the authenticated
+	// user.
+	Probe *ProbeConfig
 }
+
+// ProbeConfig is how much probing a server allows; see session.ProbeConfig.
+type ProbeConfig = session.ProbeConfig
 
 type User struct {
 	Name     string
@@ -57,6 +65,9 @@ func NewService(config ServiceConfig) (*Service, error) {
 		statsProvider:   config.StatsProvider,
 		dnsHandler:      config.DNSHandler,
 		users:           make(map[[32]byte]string),
+	}
+	if config.Probe != nil {
+		service.probeServer = session.NewProbeServer(*config.Probe)
 	}
 
 	if service.handler == nil || service.logger == nil {
@@ -130,6 +141,7 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 		s.handler.NewConnectionEx(ctx, stream, source, destination, onClose)
 	}, &s.padding, s.logger)
 	session.SetStatsProvider(s.statsProvider)
+	session.SetProbeServer(ctx, s.probeServer)
 	if s.dnsHandler != nil {
 		dnsCtx, cancel := context.WithCancel(ctx)
 		defer cancel()

@@ -219,40 +219,7 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 			c.metricsCallback.StreamClosed()
 		}
 
-		// If Session is not closed, put this Stream to pool
-		if !session.IsClosed() {
-			if c.disableReuse {
-				session.Close()
-				return
-			}
-			if session.retired(time.Now()) {
-				// Its stream was the only thing keeping a retired session open.
-				c.closeRetired(session, retireReasonLifetime, "its stream ended")
-				return
-			}
-			if failures := session.handshakeFailures.Load(); failures >= maxHandshakeFailures {
-				// A server that refuses every stream on a session while the
-				// session itself stays up, as a server instance closed under
-				// a live connection does, would otherwise keep it in the pool
-				// for good: each refusal returns it there as freshly idle.
-				c.closeRetired(session, retireReasonHandshakeFailures, fmt.Sprintf("%d streams refused in a row", failures))
-				return
-			}
-
-			select {
-			case <-c.die.Done():
-				// Now client has been closed
-				session.Close()
-			default:
-				c.idleSessionLock.Lock()
-				session.idleSince = time.Now()
-				c.idleSession.Insert(math.MaxUint64-session.seq, session)
-				c.idleSessionLock.Unlock()
-
-				// Update pool metrics when session becomes idle
-				c.updatePoolMetrics()
-			}
-		}
+		c.releaseSession(session)
 	}
 
 	stream, err = session.openStream(dieHook)
@@ -275,6 +242,45 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 	}
 
 	return stream, nil
+}
+
+// releaseSession returns a session that a stream or a probe held to the idle
+// pool, or closes it when it is not to be reused.
+func (c *Client) releaseSession(session *Session) {
+	if session.IsClosed() {
+		return
+	}
+	if c.disableReuse {
+		session.Close()
+		return
+	}
+	if session.retired(time.Now()) {
+		// Its user was the only thing keeping a retired session open.
+		c.closeRetired(session, retireReasonLifetime, "its stream ended")
+		return
+	}
+	if failures := session.handshakeFailures.Load(); failures >= maxHandshakeFailures {
+		// A server that refuses every stream on a session while the session
+		// itself stays up, as a server instance closed under a live
+		// connection does, would otherwise keep it in the pool for good:
+		// each refusal returns it there as freshly idle.
+		c.closeRetired(session, retireReasonHandshakeFailures, fmt.Sprintf("%d streams refused in a row", failures))
+		return
+	}
+
+	select {
+	case <-c.die.Done():
+		// Now client has been closed
+		session.Close()
+	default:
+		c.idleSessionLock.Lock()
+		session.idleSince = time.Now()
+		c.idleSession.Insert(math.MaxUint64-session.seq, session)
+		c.idleSessionLock.Unlock()
+
+		// Update pool metrics when session becomes idle
+		c.updatePoolMetrics()
+	}
 }
 
 // IdleLatency returns the smoothed latency of the session the next stream
