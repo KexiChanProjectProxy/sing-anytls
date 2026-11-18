@@ -352,7 +352,8 @@ func (c *Client) dnsSession(ctx context.Context) (*Session, bool, error) {
 	)
 	c.sessionsLock.Lock()
 	for _, session := range c.sessions {
-		if session.IsClosed() || session.retired(now) {
+		if session.IsClosed() || session.retired(now) || session.probing.Load() {
+			// A probing session is full of filler a query would wait behind.
 			continue
 		}
 		if !session.serverSettingsReceived() {
