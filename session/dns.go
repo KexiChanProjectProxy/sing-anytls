@@ -161,16 +161,17 @@ func (s *Session) closeDNS() {
 // returns io.ErrClosedPipe whenever the session closes before the answer, so
 // that the caller can try another session.
 func (s *Session) exchangeDNS(ctx context.Context, request []byte) ([]byte, error) {
-	return s.exchangeDNSSlot(ctx, request, nil, false)
+	return s.exchangeDNSSlot(ctx, request, nil, nil)
 }
 
 // exchangeDNSSlot is exchangeDNS for a query holding a DNS slot on the
 // session, which release, when not nil, gives back exactly once. It is called
-// on return, unless park is set and the caller gives up after the request was
-// registered: the server still answers it then, so the slot is given back
-// only when that answer arrives or the session closes, and a later query is
-// not admitted beyond what the server answers at once.
-func (s *Session) exchangeDNSSlot(ctx context.Context, request []byte, release func(), park bool) (_ []byte, err error) {
+// on return, unless the caller gives up after the request was registered:
+// the server still answers it then, so the slot is given back only when that
+// answer arrives or the session closes, and a later query is not admitted
+// beyond what the server answers at once. onPark, when not nil, is called
+// under pendingLock when that happens, before release can run.
+func (s *Session) exchangeDNSSlot(ctx context.Context, request []byte, release, onPark func()) (_ []byte, err error) {
 	held := false
 	defer func() {
 		if !held && release != nil {
@@ -260,7 +261,10 @@ func (s *Session) exchangeDNSSlot(ctx context.Context, request []byte, release f
 			s.dnsClient.pendingLock.Lock()
 			if _, ok := s.dnsClient.pending[id]; ok {
 				delete(s.dnsClient.pending, id)
-				if park && release != nil && s.dnsClient.abandoned != nil {
+				if release != nil && s.dnsClient.abandoned != nil {
+					if onPark != nil {
+						onPark()
+					}
 					s.dnsClient.abandoned[id] = release
 					held = true
 				}
@@ -386,13 +390,19 @@ func (c *Client) ExchangeDNS(ctx context.Context, request []byte) ([]byte, error
 		if err != nil {
 			return nil, err
 		}
-		// Without reuse the slot isn't kept past a query that gives up: the
-		// last query on a session closes it, which also stops the server's
-		// work on the abandoned ones, and a server that never answers must
-		// not keep the connection open.
+		var parked atomic.Bool
 		response, err := session.exchangeDNSSlot(ctx, request, func() {
+			if parked.Load() {
+				session.dnsParked.Add(-1)
+			}
 			c.releaseDNS(session)
-		}, !c.disableReuse)
+		}, func() {
+			parked.Store(true)
+			session.dnsParked.Add(1)
+		})
+		if parked.Load() {
+			c.closeIfOnlyParked(session)
+		}
 		if err == nil || !errors.Is(err, io.ErrClosedPipe) || ctx.Err() != nil {
 			return response, err
 		}
@@ -433,9 +443,8 @@ func (s *Session) acquireDNS() bool {
 // shared by the queries that overlap it and closed by the last of them, which
 // first marks it closing so that no other query takes a slot on it.
 func (c *Client) releaseDNS(session *Session) {
-	if session.dnsUsers.Add(-1) == 0 && c.disableReuse && session.dnsDialed.Load() &&
-		session.dnsUsers.CompareAndSwap(0, dnsSlotsClosing) {
-		session.Close()
+	session.dnsUsers.Add(-1)
+	if c.closeIfOnlyParked(session) {
 		return
 	}
 	if c.dnsDialActive.Load() && !session.IsClosed() {
@@ -447,6 +456,26 @@ func (c *Client) releaseDNS(session *Session) {
 			dial.kick = make(chan struct{})
 		}
 		c.dnsDialLock.Unlock()
+	}
+}
+
+// closeIfOnlyParked closes a session dialed for DNS without reuse once only
+// queries whose callers gave up hold slots on it, which also stops the
+// server's work on them, so that a server that never answers cannot keep the
+// connection open. It reports whether it closed the session.
+func (c *Client) closeIfOnlyParked(session *Session) bool {
+	if !c.disableReuse || !session.dnsDialed.Load() {
+		return false
+	}
+	for {
+		n := session.dnsUsers.Load()
+		if n < 0 || n != session.dnsParked.Load() {
+			return false
+		}
+		if session.dnsUsers.CompareAndSwap(n, dnsSlotsClosing) {
+			session.Close()
+			return true
+		}
 	}
 }
 
@@ -575,6 +604,16 @@ func (c *Client) dnsSession(ctx context.Context) (*Session, error) {
 		}
 		c.dnsDialLock.Unlock()
 
+		if dial.err == nil && dial.session != nil && dial.session.IsClosed() {
+			// The new session died at once. Fail like a query that got it,
+			// which ExchangeDNS retries once, rather than dialing again and
+			// again until the deadline.
+			session, err = c.pickDNSSession()
+			if session != nil || err != nil {
+				return session, err
+			}
+			return nil, io.ErrClosedPipe
+		}
 		if dial.err != nil && !dial.abandoned {
 			// A session may have opened another way meanwhile, such as for a
 			// stream.

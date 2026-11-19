@@ -1172,3 +1172,77 @@ func TestDNSWaiterUsesFreedSlot(t *testing.T) {
 		t.Fatalf("dialed %d sessions, want 1", n)
 	}
 }
+
+// Without reuse, a session dialed for DNS closes once only queries whose
+// callers gave up are left on it, even if the server never answers them.
+func TestDNSNoReuseClosesWithOnlyAbandonedQueries(t *testing.T) {
+	checkLeaks(t)
+	client, release, _ := slowDialClientWith(t, false, nil, func(ctx context.Context, request []byte) ([]byte, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	close(release)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := client.ExchangeDNS(ctx, []byte("q")); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want DeadlineExceeded", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		client.sessionsLock.Lock()
+		n := len(client.sessions)
+		client.sessionsLock.Unlock()
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d sessions still open", n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// Queries waiting for a dial whose session dies at once fail like the query
+// that got it, and are retried once, rather than dialing until their
+// deadline.
+func TestDNSDeadSessionNotRedialedInLoop(t *testing.T) {
+	checkLeaks(t)
+	var dials atomic.Int32
+	release := make(chan struct{})
+	client := NewClient(context.Background(), logger.NOP(), func(ctx context.Context) (net.Conn, error) {
+		dials.Add(1)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		clientConn, serverConn := net.Pipe()
+		serverConn.Close()
+		return clientConn, nil
+	}, testPadding(), 0, 0, 0, 0, 0, 0, 0, 0, 0, false, nil, "")
+	t.Cleanup(func() { client.Close() })
+	const queries = 10
+	errs := make(chan error, queries)
+	for i := 0; i < queries; i++ {
+		go func() {
+			_, err := client.ExchangeDNS(testContext(t), []byte("q"))
+			errs <- err
+		}()
+	}
+	waitDials(t, &dials, 1)
+	waitWaiters(t, client, queries-1)
+	close(release)
+	for i := 0; i < queries; i++ {
+		select {
+		case err := <-errs:
+			if err == nil {
+				t.Error("query succeeded on a dead session")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("query still dialing")
+		}
+	}
+	if n := dials.Load(); n > 4 {
+		t.Fatalf("dialed %d times for %d queries", n, queries)
+	}
+}

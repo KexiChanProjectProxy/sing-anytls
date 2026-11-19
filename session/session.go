@@ -78,6 +78,9 @@ type Session struct {
 	// dnsUsers counts the DNS queries that picked the session and haven't
 	// finished on it yet, see acquireDNS.
 	dnsUsers atomic.Int32
+	// dnsParked counts the dnsUsers slots held by queries whose callers gave
+	// up, until the server answers them.
+	dnsParked atomic.Int32
 	// probeClient is the client half of probing, and probing is set while a
 	// probe runs, when latency samples are not taken.
 	probeClient probeClientState
