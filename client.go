@@ -94,6 +94,12 @@ func (c *Client) IdleLatency() (time.Duration, bool) {
 	return c.sessionClient.IdleLatency()
 }
 
+// HasIdleDNSSession reports whether a DNS query can go on an established idle
+// session right away, without dialing a new one.
+func (c *Client) HasIdleDNSSession() bool {
+	return c.sessionClient.HasIdleDNSSession()
+}
+
 // SetSelectHandler reports the session each new stream is placed on.
 func (c *Client) SetSelectHandler(handler session.SelectHandler) {
 	c.sessionClient.SetSelectHandler(handler)
