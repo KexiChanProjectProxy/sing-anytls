@@ -340,6 +340,26 @@ func (c *Client) ExchangeDNS(ctx context.Context, request []byte) ([]byte, error
 	return nil, lastErr
 }
 
+// HasIdleDNSSession reports whether a DNS query would go on an established
+// session without dialing or waiting: an open session that isn't retired, whose
+// settings have arrived with DNS offered, and that carries no stream and no
+// DNS query in flight.  It is a best-effort hint and doesn't change any state.
+func (c *Client) HasIdleDNSSession() bool {
+	now := time.Now()
+	c.sessionsLock.Lock()
+	defer c.sessionsLock.Unlock()
+	for _, session := range c.sessions {
+		if session.IsClosed() || session.retired(now) ||
+			!session.serverSettingsReceived() || !session.DNSSupported() {
+			continue
+		}
+		if session.streamCount() == 0 && !session.dnsBusy() {
+			return true
+		}
+	}
+	return false
+}
+
 // dnsSession picks the session a DNS query goes on. It does not take the
 // session out of the idle pool, so it never disturbs where streams go, but it
 // marks the session used so that the idle timeout does not close it.

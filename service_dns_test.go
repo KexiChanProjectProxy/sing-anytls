@@ -67,3 +67,46 @@ func TestServiceDNSHandlerSeesUser(t *testing.T) {
 		t.Fatalf("handler saw user %q", user)
 	}
 }
+
+func TestClientHasIdleDNSSession(t *testing.T) {
+	ignore := goleak.IgnoreCurrent()
+	defer goleak.VerifyNone(t, ignore)
+	service, err := NewService(ServiceConfig{
+		Users:         []User{{Name: "alice", Password: "secret"}},
+		PaddingScheme: padding.DefaultPaddingScheme,
+		Handler:       discardHandler{},
+		Logger:        logger.NOP(),
+		DNSHandler: func(ctx context.Context, request []byte) ([]byte, error) {
+			return request, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	client, err := NewClient(context.Background(), ClientConfig{
+		Password: "secret",
+		Logger:   logger.NOP(),
+		DialOut: func(ctx context.Context) (net.Conn, error) {
+			clientConn, serverConn := net.Pipe()
+			go service.NewConnection(context.Background(), serverConn, M.Socksaddr{}, nil)
+			return clientConn, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close()
+
+	if client.HasIdleDNSSession() {
+		t.Fatal("no session yet, but HasIdleDNSSession is true")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err = client.ExchangeDNS(ctx, []byte("query")); err != nil {
+		t.Fatalf("ExchangeDNS: %v", err)
+	}
+	if !client.HasIdleDNSSession() {
+		t.Fatal("an established idle session exists, but HasIdleDNSSession is false")
+	}
+}
