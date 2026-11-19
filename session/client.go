@@ -32,6 +32,15 @@ type Client struct {
 	sessions     map[uint64]*Session
 	sessionsLock sync.Mutex
 
+	// dnsDialing is the session dial a DNS query started and that the other
+	// queries finding no session wait for, nil when none is running. It is
+	// protected by dnsDialLock.
+	dnsDialing  *dnsDial
+	dnsDialLock sync.Mutex
+	// dnsDialActive is set while dnsDialing is not nil, so that a query
+	// giving back a DNS slot only takes dnsDialLock when a dial runs.
+	dnsDialActive atomic.Bool
+
 	padding *atomic.TypedValue[*padding.PaddingFactory]
 
 	idleSessionTimeout          time.Duration
@@ -405,6 +414,12 @@ func (c *Client) sessionInfo(session *Session, reused bool, idleFor time.Duratio
 }
 
 func (c *Client) createSession(ctx context.Context) (*Session, error) {
+	return c.createSessionWith(ctx, nil)
+}
+
+// createSessionWith is createSession that calls prepare, when not nil, on the
+// new session before any other goroutine can find it.
+func (c *Client) createSessionWith(ctx context.Context, prepare func(*Session)) (*Session, error) {
 	underlying, err := c.dialOut(ctx)
 	if err != nil {
 		return nil, err
@@ -420,6 +435,10 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 
 	if c.maxConnectionLifetime > 0 {
 		session.maxLifetime = jitteredLifetime(c.maxConnectionLifetime, c.connectionLifetimeJitter)
+	}
+
+	if prepare != nil {
+		prepare(session)
 	}
 
 	session.dieHook = func() {
