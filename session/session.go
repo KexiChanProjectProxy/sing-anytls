@@ -72,6 +72,15 @@ type Session struct {
 
 	// dnsClient is the client half of in-session DNS, nil on a server.
 	dnsClient *dnsClientState
+	// dnsDialed is set on a client session dialed for a DNS query rather
+	// than for a stream or the idle pool.
+	dnsDialed atomic.Bool
+	// dnsUsers counts the DNS queries that picked the session and haven't
+	// finished on it yet, see acquireDNS.
+	dnsUsers atomic.Int32
+	// dnsParked counts the dnsUsers slots held by queries whose callers gave
+	// up, until the server answers them.
+	dnsParked atomic.Int32
 	// probeClient is the client half of probing, and probing is set while a
 	// probe runs, when latency samples are not taken.
 	probeClient probeClientState
@@ -121,8 +130,9 @@ func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.Paddin
 		heartbeat:      heartbeat,
 		clientMetadata: clientMetadata,
 		dnsClient: &dnsClientState{
-			ready:   make(chan struct{}),
-			pending: make(map[uint32]chan dnsResult),
+			ready:     make(chan struct{}),
+			pending:   make(map[uint32]chan dnsResult),
+			abandoned: make(map[uint32]func()),
 		},
 	}
 	s.die = make(chan struct{})

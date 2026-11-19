@@ -360,7 +360,7 @@ func TestDNSPendingFailedOnClose(t *testing.T) {
 
 func (c *Client) dnsSessionForTest(t *testing.T) (*Session, error) {
 	t.Helper()
-	session, _, err := c.dnsSession(testContext(t))
+	session, err := c.dnsSession(testContext(t))
 	return session, err
 }
 
@@ -725,7 +725,7 @@ func TestDNSPrefersSessionWithoutStreams(t *testing.T) {
 		return true
 	})
 	for i := 0; i < 20; i++ {
-		session, _, err := client.dnsSession(testContext(t))
+		session, err := client.dnsSession(testContext(t))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -744,4 +744,505 @@ func anySessionExcept(c *Client, except *Session) *Session {
 		}
 	}
 	return nil
+}
+
+// slowDialClient returns a client whose dials wait for release, or fail with
+// dialErr when it is set, and counts them. Its sessions answer DNS with
+// echoDNS. reuse=false builds it with disableReuse.
+func slowDialClient(t *testing.T, reuse bool, dialErr error) (*Client, chan struct{}, *atomic.Int32) {
+	t.Helper()
+	return slowDialClientWith(t, reuse, dialErr, echoDNS)
+}
+
+// slowDialClientWith is slowDialClient with sessions answering with handler.
+func slowDialClientWith(t *testing.T, reuse bool, dialErr error, handler DNSHandler) (*Client, chan struct{}, *atomic.Int32) {
+	t.Helper()
+	release := make(chan struct{})
+	var dials atomic.Int32
+	var lock sync.Mutex
+	var servers []*Session
+	client := NewClient(context.Background(), logger.NOP(), func(ctx context.Context) (net.Conn, error) {
+		dials.Add(1)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if dialErr != nil {
+			return nil, dialErr
+		}
+		clientConn, serverConn := net.Pipe()
+		server := dnsServerSession(serverConn, handler)
+		lock.Lock()
+		servers = append(servers, server)
+		lock.Unlock()
+		return clientConn, nil
+	}, testPadding(), 0, 0, 0, 0, 0, 0, 0, 0, 0, !reuse, nil, "")
+	t.Cleanup(func() {
+		client.Close()
+		lock.Lock()
+		defer lock.Unlock()
+		for _, server := range servers {
+			server.Close()
+		}
+	})
+	return client, release, &dials
+}
+
+// waitWaiters waits until n queries wait for the running dial.
+func waitWaiters(t *testing.T, client *Client, n int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		client.dnsDialLock.Lock()
+		waiters := 0
+		if client.dnsDialing != nil {
+			waiters = client.dnsDialing.waiters
+		}
+		client.dnsDialLock.Unlock()
+		if waiters >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d queries wait for the dial, want %d", waiters, n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// waitDials waits until n dials have started.
+func waitDials(t *testing.T, dials *atomic.Int32, n int32) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for dials.Load() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d dials started, want %d", dials.Load(), n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A burst of queries that finds no session must open one connection, not one
+// per query, and every query must be answered on it.
+func TestDNSColdBurstDialsOnce(t *testing.T) {
+	for _, reuse := range []bool{true, false} {
+		t.Run(fmt.Sprintf("reuse=%v", reuse), func(t *testing.T) {
+			checkLeaks(t)
+			client, release, dials := slowDialClient(t, reuse, nil)
+			const queries = 50
+			var wg sync.WaitGroup
+			errs := make(chan error, queries)
+			for i := 0; i < queries; i++ {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					request := []byte(fmt.Sprintf("q%d", i))
+					response, err := client.ExchangeDNS(testContext(t), request)
+					if err != nil {
+						errs <- err
+						return
+					}
+					if !bytes.Equal(response, append([]byte("ok:"), request...)) {
+						errs <- fmt.Errorf("query %d got %q", i, response)
+					}
+				}(i)
+			}
+			waitDials(t, dials, 1)
+			waitWaiters(t, client, queries-1)
+			close(release)
+			wg.Wait()
+			close(errs)
+			for err := range errs {
+				t.Error(err)
+			}
+			if n := dials.Load(); n != 1 {
+				t.Fatalf("dialed %d sessions, want 1", n)
+			}
+		})
+	}
+}
+
+// The queries waiting for a dial that fails get its error rather than each
+// dialing again.
+func TestDNSFailedDialShared(t *testing.T) {
+	checkLeaks(t)
+	dialErr := errors.New("dial refused")
+	client, release, dials := slowDialClient(t, true, dialErr)
+	const queries = 10
+	errs := make(chan error, queries)
+	for i := 0; i < queries; i++ {
+		go func() {
+			_, err := client.ExchangeDNS(testContext(t), []byte("q"))
+			errs <- err
+		}()
+	}
+	waitDials(t, dials, 1)
+	waitWaiters(t, client, queries-1)
+	close(release)
+	for i := 0; i < queries; i++ {
+		if err := <-errs; !errors.Is(err, dialErr) {
+			t.Errorf("err = %v, want %v", err, dialErr)
+		}
+	}
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("dialed %d times, want 1", n)
+	}
+}
+
+// When the query that started a dial gives up, a waiting query with time left
+// dials itself instead of failing with it.
+func TestDNSAbandonedDialRetried(t *testing.T) {
+	checkLeaks(t)
+	client, release, dials := slowDialClient(t, true, nil)
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		_, err := client.ExchangeDNS(leaderCtx, []byte("leader"))
+		leaderDone <- err
+	}()
+	waitDials(t, dials, 1)
+	followerDone := make(chan error, 1)
+	go func() {
+		response, err := client.ExchangeDNS(testContext(t), []byte("follower"))
+		if err == nil && string(response) != "ok:follower" {
+			err = fmt.Errorf("response = %q", response)
+		}
+		followerDone <- err
+	}()
+	waitWaiters(t, client, 1)
+	cancelLeader()
+	if err := <-leaderDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader err = %v, want context.Canceled", err)
+	}
+	waitDials(t, dials, 2)
+	close(release)
+	if err := <-followerDone; err != nil {
+		t.Fatalf("follower: %v", err)
+	}
+}
+
+// Without reuse, a session dialed for DNS is closed once its last query is
+// answered.
+func TestDNSNoReuseSessionClosedWhenIdle(t *testing.T) {
+	checkLeaks(t)
+	client, release, _ := slowDialClient(t, false, nil)
+	close(release)
+	if _, err := client.ExchangeDNS(testContext(t), []byte("q")); err != nil {
+		t.Fatalf("ExchangeDNS: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		client.sessionsLock.Lock()
+		n := len(client.sessions)
+		client.sessionsLock.Unlock()
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d sessions still open", n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A session carries at most maxDNSPerSession queries, about as many as a server
+// answers at once, so a larger burst spreads over as few more sessions as it
+// needs instead of being refused by the server.
+func TestDNSBurstBeyondInFlightLimitDialsMore(t *testing.T) {
+	checkLeaks(t)
+	answer := make(chan struct{})
+	var answering atomic.Int32
+	client, release, dials := slowDialClientWith(t, true, nil, func(ctx context.Context, request []byte) ([]byte, error) {
+		answering.Add(1)
+		select {
+		case <-answer:
+		case <-ctx.Done():
+		}
+		return append([]byte("ok:"), request...), nil
+	})
+	const queries = maxDNSPerSession + maxDNSPerSession/2
+	var wg sync.WaitGroup
+	errs := make(chan error, queries)
+	for i := 0; i < queries; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			request := []byte(fmt.Sprintf("q%d", i))
+			response, err := client.ExchangeDNS(testContext(t), request)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if !bytes.Equal(response, append([]byte("ok:"), request...)) {
+				errs <- fmt.Errorf("query %d got %q", i, response)
+			}
+		}(i)
+	}
+	waitDials(t, dials, 1)
+	waitWaiters(t, client, queries-1)
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for answering.Load() < queries {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d queries reached a handler, want %d", answering.Load(), queries)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if client.HasIdleDNSSession() != (dials.Load()*maxDNSPerSession > queries) {
+		t.Errorf("HasIdleDNSSession = %v with %d sessions for %d queries",
+			client.HasIdleDNSSession(), dials.Load(), queries)
+	}
+	close(answer)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if n := dials.Load(); n != 2 {
+		t.Fatalf("dialed %d sessions, want 2", n)
+	}
+}
+
+// A session whose every DNS slot is taken is not reported idle.
+func TestDNSFullSessionNotIdle(t *testing.T) {
+	checkLeaks(t)
+	client, _ := dnsTestClient(t, echoDNS)
+	session, err := client.dnsSessionForTest(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.dnsUsers.Add(-1)
+	deadline := time.Now().Add(2 * time.Second)
+	for !client.HasIdleDNSSession() {
+		if time.Now().After(deadline) {
+			t.Fatal("no idle session after dialing one")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	session.dnsUsers.Store(maxDNSPerSession)
+	if client.HasIdleDNSSession() {
+		t.Fatal("full session reported idle")
+	}
+	session.dnsUsers.Store(0)
+}
+
+// A dial error that wraps a context error, from the dialer's own timeout, is
+// still shared by the waiting queries while the one that dialed has time left.
+func TestDNSDialTimeoutShared(t *testing.T) {
+	checkLeaks(t)
+	dialErr := fmt.Errorf("dial: %w", context.DeadlineExceeded)
+	client, release, dials := slowDialClient(t, true, dialErr)
+	const queries = 5
+	errs := make(chan error, queries)
+	for i := 0; i < queries; i++ {
+		go func() {
+			_, err := client.ExchangeDNS(testContext(t), []byte("q"))
+			errs <- err
+		}()
+	}
+	waitDials(t, dials, 1)
+	waitWaiters(t, client, queries-1)
+	close(release)
+	for i := 0; i < queries; i++ {
+		if err := <-errs; !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("err = %v, want DeadlineExceeded", err)
+		}
+	}
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("dialed %d times, want 1", n)
+	}
+}
+
+// A query that gives up keeps its slot until the server answers it, since the
+// server still counts it against its in-flight limit.
+func TestDNSAbandonedQueryHoldsSlotUntilAnswered(t *testing.T) {
+	checkLeaks(t)
+	answer := make(chan struct{})
+	client, _ := dnsTestClient(t, func(ctx context.Context, request []byte) ([]byte, error) {
+		if string(request) == "slow" {
+			select {
+			case <-answer:
+			case <-ctx.Done():
+			}
+		}
+		return request, nil
+	})
+	if _, err := client.ExchangeDNS(testContext(t), []byte("warm")); err != nil {
+		t.Fatalf("ExchangeDNS: %v", err)
+	}
+	session := anySession(client)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := client.ExchangeDNS(ctx, []byte("slow")); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want DeadlineExceeded", err)
+	}
+	if n := session.dnsUsers.Load(); n != 1 {
+		t.Fatalf("%d slots taken while the server still answers, want 1", n)
+	}
+	close(answer)
+	deadline := time.Now().Add(2 * time.Second)
+	for session.dnsUsers.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d slots taken after the answer arrived", session.dnsUsers.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A query waiting for a dial because every session was full uses a slot that
+// frees up meanwhile instead of waiting for the dial.
+func TestDNSWaiterUsesFreedSlot(t *testing.T) {
+	checkLeaks(t)
+	answer := make(chan struct{})
+	client, release, dials := slowDialClientWith(t, true, nil, func(ctx context.Context, request []byte) ([]byte, error) {
+		if string(request) == "hold" {
+			select {
+			case <-answer:
+			case <-ctx.Done():
+			}
+		}
+		return request, nil
+	})
+	defer close(answer)
+	close(release)
+	if _, err := client.ExchangeDNS(testContext(t), []byte("warm")); err != nil {
+		t.Fatalf("ExchangeDNS: %v", err)
+	}
+	session := anySession(client)
+	// Take every slot but one with held queries, and the last one by hand.
+	held := make(chan error, maxDNSPerSession)
+	for i := 0; i < maxDNSPerSession-1; i++ {
+		go func() {
+			_, err := client.ExchangeDNS(testContext(t), []byte("hold"))
+			held <- err
+		}()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for session.dnsUsers.Load() != maxDNSPerSession-1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d slots taken, want %d", session.dnsUsers.Load(), maxDNSPerSession-1)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !session.acquireDNS() {
+		t.Fatal("last slot not free")
+	}
+	// Block the overflow dial so that the waiter can only get the freed slot.
+	client.dnsDialLock.Lock()
+	dial := &dnsDial{done: make(chan struct{}), kick: make(chan struct{})}
+	client.dnsDialing = dial
+	client.dnsDialActive.Store(true)
+	client.dnsDialLock.Unlock()
+	defer func() {
+		client.dnsDialLock.Lock()
+		client.dnsDialing = nil
+		client.dnsDialActive.Store(false)
+		client.dnsDialLock.Unlock()
+		close(dial.done)
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.ExchangeDNS(testContext(t), []byte("waiter"))
+		done <- err
+	}()
+	deadline = time.Now().Add(2 * time.Second)
+	for {
+		client.dnsDialLock.Lock()
+		waiters := dial.waiters
+		client.dnsDialLock.Unlock()
+		if waiters == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("query did not wait for the dial")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	client.releaseDNS(session)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("waiter: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not use the freed slot")
+	}
+	if n := dials.Load(); n != 1 {
+		t.Fatalf("dialed %d sessions, want 1", n)
+	}
+}
+
+// Without reuse, a session dialed for DNS closes once only queries whose
+// callers gave up are left on it, even if the server never answers them.
+func TestDNSNoReuseClosesWithOnlyAbandonedQueries(t *testing.T) {
+	checkLeaks(t)
+	client, release, _ := slowDialClientWith(t, false, nil, func(ctx context.Context, request []byte) ([]byte, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	close(release)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := client.ExchangeDNS(ctx, []byte("q")); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want DeadlineExceeded", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		client.sessionsLock.Lock()
+		n := len(client.sessions)
+		client.sessionsLock.Unlock()
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d sessions still open", n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// Queries waiting for a dial whose session dies at once fail like the query
+// that got it, and are retried once, rather than dialing until their
+// deadline.
+func TestDNSDeadSessionNotRedialedInLoop(t *testing.T) {
+	checkLeaks(t)
+	var dials atomic.Int32
+	release := make(chan struct{})
+	client := NewClient(context.Background(), logger.NOP(), func(ctx context.Context) (net.Conn, error) {
+		dials.Add(1)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		clientConn, serverConn := net.Pipe()
+		serverConn.Close()
+		return clientConn, nil
+	}, testPadding(), 0, 0, 0, 0, 0, 0, 0, 0, 0, false, nil, "")
+	t.Cleanup(func() { client.Close() })
+	const queries = 10
+	errs := make(chan error, queries)
+	for i := 0; i < queries; i++ {
+		go func() {
+			_, err := client.ExchangeDNS(testContext(t), []byte("q"))
+			errs <- err
+		}()
+	}
+	waitDials(t, &dials, 1)
+	waitWaiters(t, client, queries-1)
+	close(release)
+	for i := 0; i < queries; i++ {
+		select {
+		case err := <-errs:
+			if err == nil {
+				t.Error("query succeeded on a dead session")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("query still dialing")
+		}
+	}
+	if n := dials.Load(); n > 4 {
+		t.Fatalf("dialed %d times for %d queries", n, queries)
+	}
 }

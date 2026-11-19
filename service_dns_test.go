@@ -110,3 +110,45 @@ func TestClientHasIdleDNSSession(t *testing.T) {
 		t.Fatal("an established idle session exists, but HasIdleDNSSession is false")
 	}
 }
+
+// A server that never reads the authentication cannot hold the dial past the
+// caller's deadline.
+func TestClientAuthenticationFollowsContext(t *testing.T) {
+	ignore := goleak.IgnoreCurrent()
+	defer goleak.VerifyNone(t, ignore)
+	var serverConns []net.Conn
+	client, err := NewClient(context.Background(), ClientConfig{
+		Password: "secret",
+		Logger:   logger.NOP(),
+		DialOut: func(ctx context.Context) (net.Conn, error) {
+			clientConn, serverConn := net.Pipe()
+			serverConns = append(serverConns, serverConn)
+			return clientConn, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer func() {
+		client.Close()
+		for _, conn := range serverConns {
+			conn.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.ExchangeDNS(ctx, []byte("query"))
+		done <- err
+	}()
+	select {
+	case err = <-done:
+		if err == nil {
+			t.Fatal("ExchangeDNS succeeded against a server that never reads")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ExchangeDNS still blocked in the authentication write")
+	}
+}

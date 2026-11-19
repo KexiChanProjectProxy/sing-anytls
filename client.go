@@ -170,6 +170,12 @@ func (c *Client) createOutboundConnection(ctx context.Context) (net.Conn, error)
 		return nil, err
 	}
 
+	// The authentication write follows ctx, so that a server that stops
+	// reading cannot hold the dial, and the queries waiting for it, forever.
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.SetWriteDeadline(time.Now())
+	})
+
 	b := buf.NewPacket()
 	defer b.Release()
 
@@ -184,6 +190,11 @@ func (c *Client) createOutboundConnection(ctx context.Context) (net.Conn, error)
 	}
 
 	_, err = b.WriteTo(conn)
+	if !stop() {
+		// ctx ended, so the write deadline was or is about to be set.
+		conn.Close()
+		return nil, context.Cause(ctx)
+	}
 	if err != nil {
 		conn.Close()
 		return nil, err
