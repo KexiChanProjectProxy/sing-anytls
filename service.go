@@ -138,7 +138,7 @@ func (s *Service) NewConnection(ctx context.Context, conn net.Conn, source M.Soc
 			return
 		}
 
-		s.handler.NewConnectionEx(ctx, stream, source, destination, onClose)
+		s.handler.NewConnectionEx(ctx, wrapUoTStream(stream, destination), source, destination, onClose)
 	}, &s.padding, s.logger)
 	session.SetStatsProvider(s.statsProvider)
 	session.SetProbeServer(ctx, s.probeServer)

@@ -100,7 +100,9 @@ func headroomBuffer(payload []byte, headroom int) *buf.Buffer {
 	return b
 }
 
-func readAll(t *testing.T, peer *Stream, n int) []byte {
+// startRead reads n bytes from peer in the background, so that writers never
+// wait for a reader that has not started yet; wait returns what it read.
+func startRead(t *testing.T, peer *Stream, n int) (wait func() []byte) {
 	t.Helper()
 	got := make([]byte, n)
 	done := make(chan error, 1)
@@ -108,15 +110,18 @@ func readAll(t *testing.T, peer *Stream, n int) []byte {
 		_, err := io.ReadFull(peer, got)
 		done <- err
 	}()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("ReadFull: %v", err)
+	return func() []byte {
+		t.Helper()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("ReadFull: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out reading from peer")
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out reading from peer")
+		return got
 	}
-	return got
 }
 
 func TestStreamFrontHeadroom(t *testing.T) {
@@ -149,8 +154,11 @@ func TestStreamWriteBuffer(t *testing.T) {
 	}
 	var want bytes.Buffer
 	for i, c := range cases {
+		want.Write(pattern(c.size, i))
+	}
+	wait := startRead(t, peer, want.Len())
+	for i, c := range cases {
 		payload := pattern(c.size, i)
-		want.Write(payload)
 		var err error
 		if c.plain {
 			_, err = stream.Write(payload)
@@ -161,7 +169,7 @@ func TestStreamWriteBuffer(t *testing.T) {
 			t.Fatalf("%s: %v", c.name, err)
 		}
 	}
-	got := readAll(t, peer, want.Len())
+	got := wait()
 	if !bytes.Equal(got, want.Bytes()) {
 		t.Fatalf("peer received different bytes (%d bytes)", len(got))
 	}
@@ -180,12 +188,13 @@ func TestStreamBufioCopy(t *testing.T) {
 		srcW.Write(payload)
 		srcW.Close()
 	}()
+	wait := startRead(t, peer, size)
 	copyDone := make(chan error, 1)
 	go func() {
 		_, err := bufio.Copy(stream, srcR)
 		copyDone <- err
 	}()
-	got := readAll(t, peer, size)
+	got := wait()
 	if !bytes.Equal(got, payload) {
 		t.Fatal("peer received different bytes")
 	}
