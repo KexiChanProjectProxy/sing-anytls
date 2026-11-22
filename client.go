@@ -161,7 +161,7 @@ func (c *Client) CreateProxy(ctx context.Context, destination M.Socksaddr) (net.
 		conn.Close()
 		return nil, err
 	}
-	return conn, nil
+	return wrapUoTStream(conn, destination), nil
 }
 
 func (c *Client) createOutboundConnection(ctx context.Context) (net.Conn, error) {
